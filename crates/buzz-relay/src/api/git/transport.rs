@@ -5,7 +5,8 @@
 //! - `POST /git/{owner}/{repo}/git-upload-pack` — clone/fetch
 //! - `POST /git/{owner}/{repo}/git-receive-pack` — push
 //!
-//! Auth: NIP-98 on all routes (clone + push). No public repos for v1.
+//! Auth: NIP-98 on all routes (clone + push), except stock Git's exact
+//! four-byte large-request capability probe. No public repos for v1.
 //! Transport: shells out to `git --stateless-rpc` with `env_clear()`.
 
 use std::future::Future;
@@ -58,6 +59,15 @@ const INFO_REFS_MAX_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
 /// bodies are pkt-lines of wants/haves (~50 bytes per ref); even a repo
 /// with a million refs stays far under this.
 const UPLOAD_PACK_MAX_DECODED_BYTES: u64 = 64 * 1024 * 1024;
+/// Stock Git's `remote-curl` large-request capability probe.
+///
+/// Git sends this exact unauthenticated request before the real, authenticated
+/// pack POST when the request exceeds `http.postBuffer`. The probe carries no
+/// repository data or ref updates; its response body is ignored.
+const RECEIVE_PACK_LARGE_REQUEST_PROBE: &[u8; 4] = b"0000";
+const RECEIVE_PACK_PROBE_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const RECEIVE_PACK_REQUEST_CONTENT_TYPE: &str = "application/x-git-receive-pack-request";
+const RECEIVE_PACK_RESULT_CONTENT_TYPE: &str = "application/x-git-receive-pack-result";
 
 /// NIP-98 auth extractor for git routes.
 ///
@@ -74,6 +84,38 @@ pub struct GitAuth {
     pub pubkey: nostr::PublicKey,
     /// Server-resolved tenant bound from the request Host before auth checks.
     pub tenant: TenantContext,
+}
+
+/// Authentication state for the receive-pack endpoint.
+///
+/// Missing authentication is preserved only so [`receive_pack`] can recognize
+/// stock Git's exact four-byte large-request probe. A present but invalid
+/// Authorization header still fails through [`GitAuth`] before the handler
+/// runs, and every non-probe request remains authenticated.
+pub enum ReceivePackAuth {
+    /// A normal authenticated receive-pack request.
+    Authenticated(GitAuth),
+    /// No Authorization header was present.
+    Missing,
+}
+
+impl axum::extract::FromRequestParts<Arc<AppState>> for ReceivePackAuth {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        if parts.headers.contains_key(header::AUTHORIZATION) {
+            <GitAuth as axum::extract::FromRequestParts<Arc<AppState>>>::from_request_parts(
+                parts, state,
+            )
+            .await
+            .map(Self::Authenticated)
+        } else {
+            Ok(Self::Missing)
+        }
+    }
 }
 
 impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
@@ -978,6 +1020,51 @@ pub async fn upload_pack(
     )
 }
 
+fn missing_receive_pack_auth_response() -> Response {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("WWW-Authenticate", "Nostr realm=\"buzz\", method=\"POST\"")
+        .body(Body::from("missing Authorization header"))
+        .unwrap()
+}
+
+/// Answer only stock Git's content-free large-request probe.
+///
+/// This intentionally runs before repo-name validation, tenant binding,
+/// hydration, or subprocess work. Existing and nonexistent repository paths
+/// therefore receive the same fixed response and the exception cannot become
+/// an existence oracle. Every other unauthenticated request remains a 401.
+async fn receive_pack_probe_response(
+    headers: &axum::http::HeaderMap,
+    body: Body,
+) -> Result<Response, Response> {
+    let content_type_matches = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        == Some(RECEIVE_PACK_REQUEST_CONTENT_TYPE);
+    if !content_type_matches {
+        return Err(missing_receive_pack_auth_response());
+    }
+
+    let bytes = tokio::time::timeout(
+        RECEIVE_PACK_PROBE_BODY_TIMEOUT,
+        axum::body::to_bytes(body, RECEIVE_PACK_LARGE_REQUEST_PROBE.len()),
+    )
+    .await
+    .map_err(|_| missing_receive_pack_auth_response())?
+    .map_err(|_| missing_receive_pack_auth_response())?;
+    if bytes.as_ref() != RECEIVE_PACK_LARGE_REQUEST_PROBE {
+        return Err(missing_receive_pack_auth_response());
+    }
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, RECEIVE_PACK_RESULT_CONTENT_TYPE)
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::empty())
+        .unwrap())
+}
+
 /// `POST /git/{owner}/{repo}/git-receive-pack`
 ///
 /// Handles push — client sends ref updates + pack data.
@@ -1007,11 +1094,16 @@ pub async fn upload_pack(
 ///    *only then* builds the 2xx.
 pub async fn receive_pack(
     State(state): State<Arc<AppState>>,
-    auth: GitAuth,
+    auth: ReceivePackAuth,
     headers: axum::http::HeaderMap,
     AxumPath(params): AxumPath<GitRepoParams>,
     body: Body,
 ) -> Result<Response, Response> {
+    let auth = match auth {
+        ReceivePackAuth::Authenticated(auth) => auth,
+        ReceivePackAuth::Missing => return receive_pack_probe_response(&headers, body).await,
+    };
+
     let repo_name = validate_repo_id(&params.owner, &params.repo)?;
     let body = decode_git_request_body(&headers, body, state.config.git_max_pack_bytes);
     let pusher_hex = hex::encode(auth.pubkey.to_bytes());
@@ -1912,6 +2004,98 @@ pub fn git_router(state: Arc<AppState>) -> Router {
         .route("/git/{owner}/{repo}/git-receive-pack", post(receive_pack))
         .layer(RequestBodyLimitLayer::new(body_limit))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod receive_pack_probe_tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    fn probe_headers(content_type: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(content_type) = content_type {
+            headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_str(content_type).expect("valid content type"),
+            );
+        }
+        headers
+    }
+
+    #[tokio::test]
+    async fn exact_unauthenticated_large_request_probe_gets_fixed_response() {
+        let headers = probe_headers(Some(RECEIVE_PACK_REQUEST_CONTENT_TYPE));
+        let response = receive_pack_probe_response(&headers, Body::from("0000"))
+            .await
+            .expect("stock Git probe must be accepted");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static(RECEIVE_PACK_RESULT_CONTENT_TYPE))
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-cache"))
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1)
+            .await
+            .expect("fixed response body");
+        assert!(body.is_empty(), "probe response must disclose no data");
+    }
+
+    #[tokio::test]
+    async fn every_near_probe_shape_remains_unauthorized() {
+        let cases = [
+            (None, "0000", "missing content type"),
+            (Some("text/plain"), "0000", "wrong content type"),
+            (
+                Some("application/x-git-receive-pack-request; charset=utf-8"),
+                "0000",
+                "content type parameters",
+            ),
+            (Some(RECEIVE_PACK_REQUEST_CONTENT_TYPE), "", "empty body"),
+            (
+                Some(RECEIVE_PACK_REQUEST_CONTENT_TYPE),
+                "0001",
+                "wrong body",
+            ),
+            (
+                Some(RECEIVE_PACK_REQUEST_CONTENT_TYPE),
+                "0000x",
+                "probe plus extra byte",
+            ),
+        ];
+
+        for (content_type, body, case) in cases {
+            let headers = probe_headers(content_type);
+            let rejection = receive_pack_probe_response(&headers, Body::from(body))
+                .await
+                .expect_err(case);
+            assert_eq!(rejection.status(), StatusCode::UNAUTHORIZED, "{case}");
+            assert_eq!(
+                rejection.headers().get("WWW-Authenticate"),
+                Some(&HeaderValue::from_static(
+                    "Nostr realm=\"buzz\", method=\"POST\""
+                )),
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unauthenticated_probe_body_cannot_stall_indefinitely() {
+        let headers = probe_headers(Some(RECEIVE_PACK_REQUEST_CONTENT_TYPE));
+        let body = Body::from_stream(futures::stream::pending::<
+            Result<bytes::Bytes, std::convert::Infallible>,
+        >());
+
+        let rejection = receive_pack_probe_response(&headers, body)
+            .await
+            .expect_err("stalled probe body must time out");
+
+        assert_eq!(rejection.status(), StatusCode::UNAUTHORIZED);
+    }
 }
 
 #[cfg(test)]

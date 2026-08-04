@@ -267,6 +267,85 @@ fn git_s3_probe_builds_both_addressing_styles() {
 
 #[tokio::test]
 #[ignore = "requires live relay + MinIO + git"]
+async fn git_large_push_authenticates_after_receive_pack_probe() {
+    use nostr::ToBech32;
+
+    let owner = Keys::generate();
+    let owner_hex = owner.public_key().to_hex();
+    let owner_nsec = owner.secret_key().to_bech32().unwrap();
+    let repo = format!("e2e-git-large-{}", std::process::id());
+
+    let channel = create_test_channel(&owner).await;
+    let announce = EventBuilder::new(Kind::from(30617), "")
+        .tags(vec![
+            Tag::parse(["d", &repo]).unwrap(),
+            Tag::parse(["name", "e2e large git push"]).unwrap(),
+            Tag::parse(["buzz-channel", &channel]).unwrap(),
+        ])
+        .sign_with_keys(&owner)
+        .unwrap();
+    post_event(&announce).await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let tmp = tempdir_named("buzz-e2e-git-large");
+    let url = format!("{}/git/{}/{}", relay_http_url(), owner_hex, repo);
+    git(
+        &["clone", "--quiet", &url, "source"],
+        tmp.path(),
+        &owner_nsec,
+    );
+    let source = tmp.path().join("source");
+
+    // Force stock Git through remote-curl's large-request path without making
+    // the fixture expensive. That path first sends an unauthenticated four-byte
+    // `0000` probe, then sends the real pack with the helper-provided Nostr
+    // Authorization header. Small pushes never exercise that transition.
+    git(
+        &["config", "http.postBuffer", "65536"],
+        &source,
+        &owner_nsec,
+    );
+    let mut payload = vec![0_u8; 256 * 1024];
+    let mut x = 0x9e37_79b9_7f4a_7c15_u64;
+    for byte in &mut payload {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *byte = (x >> 24) as u8;
+    }
+    std::fs::write(source.join("payload.bin"), &payload).unwrap();
+    git(&["add", "payload.bin"], &source, &owner_nsec);
+    git(
+        &["commit", "--quiet", "-m", "large authenticated push"],
+        &source,
+        &owner_nsec,
+    );
+    git(&["branch", "-M", "main"], &source, &owner_nsec);
+    git(&["push", "--quiet", "origin", "main"], &source, &owner_nsec);
+    let pushed_sha = git(&["rev-parse", "main"], &source, &owner_nsec)
+        .trim()
+        .to_string();
+
+    git(
+        &["clone", "--quiet", &url, "verification"],
+        tmp.path(),
+        &owner_nsec,
+    );
+    let verification = tmp.path().join("verification");
+    assert_eq!(
+        git(&["rev-parse", "main"], &verification, &owner_nsec).trim(),
+        pushed_sha,
+        "fresh clone must observe the exact large-push commit"
+    );
+    assert_eq!(
+        std::fs::read(verification.join("payload.bin")).unwrap(),
+        payload,
+        "fresh clone must reproduce the large-push payload byte-for-byte"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live relay + MinIO + git"]
 async fn git_clone_push_fetch_force_roundtrip() {
     use nostr::ToBech32;
 
