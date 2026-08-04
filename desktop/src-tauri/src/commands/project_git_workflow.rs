@@ -13,6 +13,10 @@ use super::project_repo_paths::{
 use crate::app_state::AppState;
 use crate::managed_agents::{load_managed_agents, spawn_key_refusal};
 use crate::relay::submit_signed_event_with_keys;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use buzz_core_pkg::git_perms::{
+    GIT_MERGE_AUTHORIZATION_HEADER, GIT_MERGE_AUTHORIZATION_MAX_ENCODED_BYTES,
+};
 use nostr::{Event, EventBuilder, JsonUtil, Keys, Kind, Tag, Timestamp};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
@@ -40,6 +44,7 @@ use super::project_git_merge_error::{classify_merge_error, ProjectPullRequestMer
 struct ProjectRepoMergeGitResult {
     message: String,
     merge_commit: String,
+    status_event: String,
 }
 
 /// Validated repository and pull-request metadata for a native merge.
@@ -169,14 +174,20 @@ fn build_merged_status_event(
     repo_address: &str,
     pull_request_id: &str,
     pull_request_author: &str,
-    merge_commit: &str,
+    commits: (&str, &str),
+    target_branch: &str,
     created_at: u64,
 ) -> Result<String, String> {
+    let (source_commit, merge_commit) = commits;
     let owner = keys.public_key().to_hex();
     let (pull_request_id, pull_request_author) =
         validate_merge_status_metadata(repo_address, &owner, pull_request_id, pull_request_author)?;
+    let source_commit =
+        normalize_commit(source_commit).ok_or_else(|| "Invalid source commit.".to_string())?;
     let merge_commit =
         normalize_commit(merge_commit).ok_or_else(|| "Invalid merge commit.".to_string())?;
+    let target_branch = normalize_branch_option(Some(target_branch))
+        .ok_or_else(|| "Invalid target branch.".to_string())?;
     let created_at = created_at.max(Timestamp::now().as_secs());
 
     let mut raw_tags = vec![
@@ -188,8 +199,10 @@ fn build_merged_status_event(
         raw_tags.push(vec!["p", pull_request_author.as_str()]);
     }
     raw_tags.extend([
+        vec!["source-commit", source_commit.as_str()],
         vec!["merge-commit", merge_commit.as_str()],
         vec!["r", merge_commit.as_str()],
+        vec!["target-branch", target_branch.as_str()],
     ]);
     let tags = raw_tags
         .into_iter()
@@ -202,6 +215,16 @@ fn build_merged_status_event(
         .sign_with_keys(keys)
         .map(|event| event.as_json())
         .map_err(|error| format!("sign merged pull request status: {error}"))
+}
+
+fn merge_authorization_header_config(status_event: &str) -> Result<String, String> {
+    let encoded = URL_SAFE_NO_PAD.encode(status_event.as_bytes());
+    if encoded.len() > GIT_MERGE_AUTHORIZATION_MAX_ENCODED_BYTES {
+        return Err("Signed merge authorization exceeds the Git header limit.".to_string());
+    }
+    Ok(format!(
+        "http.extraHeader={GIT_MERGE_AUTHORIZATION_HEADER}: {encoded}"
+    ))
 }
 
 fn build_pull_request_status_event(
@@ -548,6 +571,7 @@ pub async fn merge_project_pull_request(
         &pull_request_author,
     )?;
     let auth = build_git_auth_config_for_keys(&owner_identity.keys)?;
+    let merge_keys = owner_identity.keys.clone();
 
     let git_result = tauri::async_runtime::spawn_blocking(
         move || -> Result<ProjectRepoMergeGitResult, ProjectPullRequestMergeError> {
@@ -628,8 +652,20 @@ pub async fn merge_project_pull_request(
                 .ok()
                 .and_then(|output| first_output_line(&output))
                 .ok_or_else(|| "Could not resolve the merge commit.".to_string())?;
+            let status_event = build_merged_status_event(
+                &merge_keys,
+                &repo_address,
+                &pull_request_id,
+                &pull_request_author,
+                (&expected_commit, &merge_commit),
+                &target_branch,
+                status_created_at,
+            )?;
+            let authorization_config = merge_authorization_header_config(&status_event)?;
             run_git(
                 &[
+                    "-c",
+                    authorization_config.as_str(),
                     "push",
                     "--end-of-options",
                     "origin",
@@ -642,6 +678,7 @@ pub async fn merge_project_pull_request(
             Ok(ProjectRepoMergeGitResult {
                 message: format!("Merged {source_branch} into {target_branch}."),
                 merge_commit,
+                status_event,
             })
         },
     )
@@ -652,15 +689,7 @@ pub async fn merge_project_pull_request(
             format!("pull request merge task failed: {error}"),
         )
     })??;
-    let status_event = build_merged_status_event(
-        &owner_identity.keys,
-        &repo_address,
-        &pull_request_id,
-        &pull_request_author,
-        &git_result.merge_commit,
-        status_created_at,
-    )?;
-    let signed_status = Event::from_json(&status_event)
+    let signed_status = Event::from_json(&git_result.status_event)
         .map_err(|error| format!("parse signed merged status: {error}"))?;
     let status_publication_error = submit_signed_event_with_keys(
         &signed_status,
@@ -673,7 +702,7 @@ pub async fn merge_project_pull_request(
     Ok(ProjectRepoMergeResult {
         message: git_result.message,
         merge_commit: git_result.merge_commit,
-        status_event,
+        status_event: git_result.status_event,
         status_publication_error,
     })
 }
@@ -682,10 +711,14 @@ pub async fn merge_project_pull_request(
 mod tests {
     use super::{
         align_unborn_head_branch, build_merged_status_event, build_pull_request_status_event,
-        build_review_request_event, normalize_commit, same_repository,
-        validate_merge_status_metadata,
+        build_review_request_event, merge_authorization_header_config, normalize_commit,
+        same_repository, validate_merge_status_metadata,
     };
     use crate::commands::project_git_exec::{build_test_git_auth_config, run_git};
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use buzz_core_pkg::git_perms::{
+        GIT_MERGE_AUTHORIZATION_HEADER, GIT_MERGE_AUTHORIZATION_MAX_ENCODED_BYTES,
+    };
     use nostr::{Event, JsonUtil, Keys, Timestamp};
 
     #[test]
@@ -734,6 +767,7 @@ mod tests {
         let owner = keys.public_key().to_hex();
         let pull_request_id = "d".repeat(64);
         let pull_request_author = "b".repeat(64);
+        let source_commit = "c".repeat(40);
         let merge_commit = "e".repeat(40);
         let repo_address = format!("30617:{owner}:buzz");
         let before = Timestamp::now().as_secs();
@@ -743,7 +777,8 @@ mod tests {
                 &repo_address,
                 &pull_request_id,
                 &pull_request_author,
-                &merge_commit,
+                (&source_commit, &merge_commit),
+                "main",
                 123,
             )
             .unwrap(),
@@ -756,7 +791,15 @@ mod tests {
         assert!(event
             .tags
             .iter()
+            .any(|tag| tag.as_slice() == ["source-commit", source_commit.as_str()]));
+        assert!(event
+            .tags
+            .iter()
             .any(|tag| tag.as_slice() == ["merge-commit", merge_commit.as_str()]));
+        assert!(event
+            .tags
+            .iter()
+            .any(|tag| tag.as_slice() == ["target-branch", "main"]));
         assert!(event.verify().is_ok());
     }
 
@@ -771,7 +814,8 @@ mod tests {
                 &format!("30617:{owner}:buzz"),
                 &"d".repeat(64),
                 &"b".repeat(64),
-                &"e".repeat(40),
+                (&"c".repeat(40), &"e".repeat(40)),
+                "main",
                 requested,
             )
             .unwrap(),
@@ -779,6 +823,26 @@ mod tests {
         .unwrap();
 
         assert_eq!(event.created_at.as_secs(), requested);
+    }
+
+    #[test]
+    fn merge_authorization_header_round_trips_the_exact_signed_event() {
+        let event = r#"{"id":"signed-event"}"#;
+        let config = merge_authorization_header_config(event).expect("header config");
+        let prefix = format!("http.extraHeader={GIT_MERGE_AUTHORIZATION_HEADER}: ");
+        let encoded = config.strip_prefix(&prefix).expect("exact header prefix");
+        let decoded = URL_SAFE_NO_PAD.decode(encoded).expect("base64url payload");
+
+        assert_eq!(decoded, event.as_bytes());
+        assert!(!encoded.contains('='), "Git header uses unpadded base64url");
+    }
+
+    #[test]
+    fn merge_authorization_header_rejects_oversized_payload() {
+        // Base64 expands by 4/3, so a source at the encoded limit is certainly
+        // too large and exercises the post-encoding bound used by the relay.
+        let event = "x".repeat(GIT_MERGE_AUTHORIZATION_MAX_ENCODED_BYTES);
+        assert!(merge_authorization_header_config(&event).is_err());
     }
 
     #[test]

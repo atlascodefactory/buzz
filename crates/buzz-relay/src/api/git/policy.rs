@@ -34,7 +34,9 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use base64::Engine as _;
 use hmac::{Hmac, KeyInit, Mac};
+use nostr::{Event, JsonUtil, Kind};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tracing::{error, warn};
@@ -43,8 +45,9 @@ use uuid::Uuid;
 
 use buzz_core::channel::MemberRole;
 use buzz_core::git_perms::{
-    evaluate_push, parse_protection_tags, Denial, RefUpdate, UpdateKind,
-    GIT_NO_CHANNEL_BINDING_BODY,
+    evaluate_push_with_patch_authorizations, parse_protection_tags, Denial, PatchAuthorization,
+    RefUpdate, UpdateKind, GIT_MERGE_AUTHORIZATION_MAX_AGE_SECS,
+    GIT_MERGE_AUTHORIZATION_MAX_ENCODED_BYTES, GIT_NO_CHANNEL_BINDING_BODY,
 };
 use buzz_db::EventQuery;
 
@@ -67,6 +70,8 @@ pub struct HookCallbackRequest {
     pub pusher_pubkey: String,
     /// Ref updates from git stdin (old_oid, new_oid, ref_name, is_ancestor).
     pub ref_updates: Vec<HookRefUpdate>,
+    /// URL-safe base64 owner-signed NIP-34 merged status, or empty for a direct push.
+    pub merge_authorization: String,
     /// Unix timestamp when the hook was invoked.
     pub timestamp: u64,
     /// HMAC-SHA256 signature over the canonical payload.
@@ -85,6 +90,9 @@ pub struct HookRefUpdate {
     /// Result of `git merge-base --is-ancestor old new`.
     /// For creates/deletes this is false (ignored by classifier).
     pub is_ancestor: bool,
+    /// Result of `git merge-base --is-ancestor <signed PR head> new`.
+    /// False when the push carries no merge proof or the relation cannot be proven.
+    pub merge_source_is_ancestor: bool,
 }
 
 /// Response to the hook — either allow or deny.
@@ -119,9 +127,11 @@ impl From<Denial> for DenialResponse {
 ///
 /// Format (length-prefixed, `|`-separated, structurally unambiguous):
 /// ```text
-/// len(repo_id):repo_id | repo_owner(64) | community_id(36) | pusher(64) | sorted_refs | timestamp
+/// len(repo_id):repo_id | repo_owner(64) | community_id(36) | pusher(64) |
+/// sorted_refs | len(merge_authorization):merge_authorization | timestamp
 /// ```
-/// where each ref is: `old_oid(40) + new_oid(40) + len(ref_name):ref_name + is_ancestor("1"/"0")`
+/// where each ref is: `old_oid(40) + new_oid(40) + len(ref_name):ref_name
+/// + is_ancestor("1"/"0") + merge_source_is_ancestor("1"/"0")`
 ///
 /// Fixed-length fields (OIDs=40, pubkeys=64) need no length prefix.
 /// Variable-length fields (repo_id, ref_name) are length-prefixed to prevent concatenation ambiguity.
@@ -151,7 +161,16 @@ fn compute_hmac(secret: &[u8], req: &HookCallbackRequest) -> Vec<u8> {
         mac.update(b":");
         mac.update(r.ref_name.as_bytes());
         mac.update(if r.is_ancestor { b"1" } else { b"0" });
+        mac.update(if r.merge_source_is_ancestor {
+            b"1"
+        } else {
+            b"0"
+        });
     }
+    mac.update(b"|");
+    mac.update(req.merge_authorization.len().to_string().as_bytes());
+    mac.update(b":");
+    mac.update(req.merge_authorization.as_bytes());
     mac.update(b"|");
     mac.update(req.timestamp.to_string().as_bytes());
 
@@ -168,6 +187,161 @@ fn verify_hmac(secret: &[u8], req: &HookCallbackRequest) -> bool {
     // Constant-time comparison.
     use subtle::ConstantTimeEq;
     expected.ct_eq(&provided).into()
+}
+
+fn unique_tag_value<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
+    let mut values = event.tags.iter().filter_map(|tag| {
+        let parts = tag.as_slice();
+        (parts.first().map(String::as_str) == Some(name))
+            .then(|| parts.get(1).map(String::as_str))
+            .flatten()
+    });
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+fn root_event_id(event: &Event) -> Option<&str> {
+    let mut roots = event.tags.iter().filter_map(|tag| {
+        let parts = tag.as_slice();
+        (parts.first().map(String::as_str) == Some("e")
+            && parts.get(3).map(String::as_str) == Some("root"))
+        .then(|| parts.get(1).map(String::as_str))
+        .flatten()
+    });
+    let root = roots.next()?;
+    roots.next().is_none().then_some(root)
+}
+
+fn valid_commit(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MergeAuthorizationClaims {
+    authorization: PatchAuthorization,
+    pull_request_id: Vec<u8>,
+    repo_address: String,
+    target_branch: String,
+    source_commit: String,
+}
+
+fn parse_merge_authorization_claims(
+    req: &HookCallbackRequest,
+    now: u64,
+) -> Result<Option<MergeAuthorizationClaims>, String> {
+    if req.merge_authorization.is_empty() {
+        return Ok(None);
+    }
+    if req.merge_authorization.len() > GIT_MERGE_AUTHORIZATION_MAX_ENCODED_BYTES {
+        return Err("merge authorization exceeds maximum size".to_string());
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(req.merge_authorization.as_bytes())
+        .map_err(|_| "merge authorization is not valid URL-safe base64".to_string())?;
+    let json = String::from_utf8(bytes)
+        .map_err(|_| "merge authorization is not valid UTF-8".to_string())?;
+    let event = Event::from_json(json)
+        .map_err(|_| "merge authorization is not a valid Nostr event".to_string())?;
+    if event.kind != Kind::Custom(1631) || event.verify().is_err() {
+        return Err("merge authorization must be a valid signed NIP-34 merged status".to_string());
+    }
+    if event.pubkey.to_hex() != req.repo_owner || req.pusher_pubkey != req.repo_owner {
+        return Err(
+            "merge authorization must be signed and pushed by the repository owner".to_string(),
+        );
+    }
+    let event_ts = event.created_at.as_secs();
+    if now.saturating_sub(event_ts) > GIT_MERGE_AUTHORIZATION_MAX_AGE_SECS
+        || event_ts.saturating_sub(now) > 30
+    {
+        return Err("merge authorization is expired or too far in the future".to_string());
+    }
+
+    let repo_address = format!("30617:{}:{}", req.repo_owner, req.repo_id);
+    if unique_tag_value(&event, "a") != Some(repo_address.as_str()) {
+        return Err("merge authorization repository does not match the push".to_string());
+    }
+    let target_branch = unique_tag_value(&event, "target-branch")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "merge authorization has no unique target branch".to_string())?
+        .to_string();
+    let ref_name = format!("refs/heads/{target_branch}");
+    let merge_commit = unique_tag_value(&event, "merge-commit")
+        .filter(|value| valid_commit(value))
+        .ok_or_else(|| "merge authorization has no unique merge commit".to_string())?;
+    if unique_tag_value(&event, "r") != Some(merge_commit) {
+        return Err("merge authorization commit tags disagree".to_string());
+    }
+    let source_commit = unique_tag_value(&event, "source-commit")
+        .filter(|value| valid_commit(value))
+        .ok_or_else(|| "merge authorization has no unique source commit".to_string())?
+        .to_ascii_lowercase();
+    let pull_request_id = root_event_id(&event)
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| "merge authorization has no unique pull-request root".to_string())?;
+    let pull_request_id = hex::decode(pull_request_id)
+        .map_err(|_| "merge authorization pull-request id is invalid".to_string())?;
+
+    Ok(Some(MergeAuthorizationClaims {
+        authorization: PatchAuthorization {
+            ref_name,
+            new_oid: merge_commit.to_ascii_lowercase(),
+        },
+        pull_request_id,
+        repo_address,
+        target_branch,
+        source_commit,
+    }))
+}
+
+async fn resolve_merge_authorization(
+    state: &AppState,
+    community: buzz_core::CommunityId,
+    req: &HookCallbackRequest,
+    now: u64,
+) -> Result<Vec<PatchAuthorization>, String> {
+    let Some(claims) = parse_merge_authorization_claims(req, now)? else {
+        return Ok(Vec::new());
+    };
+    let query = EventQuery {
+        kinds: Some(vec![1618]),
+        ids: Some(vec![claims.pull_request_id]),
+        global_only: true,
+        limit: Some(1),
+        ..EventQuery::for_community(community)
+    };
+    let pull_request = state
+        .db
+        .query_events(&query)
+        .await
+        .map_err(|error| format!("pull-request lookup failed: {error}"))?
+        .pop()
+        .ok_or_else(|| "merge authorization pull request was not found".to_string())?;
+    if unique_tag_value(&pull_request.event, "a") != Some(claims.repo_address.as_str())
+        || unique_tag_value(&pull_request.event, "target-branch")
+            != Some(claims.target_branch.as_str())
+        || unique_tag_value(&pull_request.event, "c").is_none_or(|commit| {
+            !valid_commit(commit) || !commit.eq_ignore_ascii_case(&claims.source_commit)
+        })
+    {
+        return Err(
+            "merge authorization pull request does not match the repository, target, and source commit"
+                .to_string(),
+        );
+    }
+    if !req.ref_updates.iter().any(|update| {
+        update.ref_name == claims.authorization.ref_name
+            && update
+                .new_oid
+                .eq_ignore_ascii_case(&claims.authorization.new_oid)
+            && update.merge_source_is_ancestor
+    }) {
+        return Err(
+            "merge authorization result does not contain the pull-request commit".to_string(),
+        );
+    }
+
+    Ok(vec![claims.authorization])
 }
 
 /// `POST /internal/git/policy` — pre-receive hook callback.
@@ -205,6 +379,14 @@ pub async fn hook_policy_check(
     let community = buzz_core::CommunityId::from_uuid(community_uuid);
     if req.ref_updates.is_empty() || req.ref_updates.len() > 500 {
         return (StatusCode::FORBIDDEN, "invalid ref_updates count").into_response();
+    }
+    if req.merge_authorization.len() > GIT_MERGE_AUTHORIZATION_MAX_ENCODED_BYTES
+        || !req
+            .merge_authorization
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return (StatusCode::FORBIDDEN, "invalid merge_authorization").into_response();
     }
     for r in &req.ref_updates {
         if r.old_oid.len() != 40 || !r.old_oid.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -420,7 +602,17 @@ pub async fn hook_policy_check(
         })
         .collect();
 
-    match evaluate_push(&updates, git_role, &rules) {
+    let patch_authorizations = match resolve_merge_authorization(&state, community, &req, now).await
+    {
+        Ok(authorizations) => authorizations,
+        Err(reason) => {
+            warn!(repo = %req.repo_id, reason = %reason, "hook callback: invalid merge authorization");
+            return (StatusCode::FORBIDDEN, reason).into_response();
+        }
+    };
+
+    match evaluate_push_with_patch_authorizations(&updates, git_role, &rules, &patch_authorizations)
+    {
         Ok(()) => Json(HookCallbackResponse {
             allowed: true,
             denials: vec![],
@@ -454,6 +646,7 @@ pub fn generate_hook_hmac(
         community_id: community_id.to_string(),
         pusher_pubkey: pusher_pubkey.to_string(),
         ref_updates: ref_updates.to_vec(),
+        merge_authorization: String::new(),
         timestamp,
         signature: String::new(), // Not used in computation.
     };
@@ -464,6 +657,8 @@ pub fn generate_hook_hmac(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use nostr::{EventBuilder, Keys, Tag, Timestamp};
 
     fn make_request() -> HookCallbackRequest {
         HookCallbackRequest {
@@ -476,7 +671,9 @@ mod tests {
                 new_oid: "2".repeat(40),
                 ref_name: "refs/heads/main".to_string(),
                 is_ancestor: true,
+                merge_source_is_ancestor: false,
             }],
+            merge_authorization: String::new(),
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -488,6 +685,197 @@ mod tests {
     fn sign_request(req: &mut HookCallbackRequest, secret: &[u8]) {
         let mac = compute_hmac(secret, req);
         req.signature = hex::encode(mac);
+    }
+
+    fn encoded_merge_authorization(
+        keys: &Keys,
+        repo_address: &str,
+        pull_request_id: &str,
+        target_branch: &str,
+        source_commit: &str,
+        merge_commit: &str,
+        created_at: u64,
+    ) -> String {
+        let tags = [
+            vec!["e", pull_request_id, "", "root"],
+            vec!["a", repo_address],
+            vec!["source-commit", source_commit],
+            vec!["merge-commit", merge_commit],
+            vec!["r", merge_commit],
+            vec!["target-branch", target_branch],
+        ]
+        .into_iter()
+        .map(|tag| Tag::parse(tag).expect("valid test tag"))
+        .collect::<Vec<_>>();
+        let event = EventBuilder::new(Kind::Custom(1631), "")
+            .tags(tags)
+            .custom_created_at(Timestamp::from(created_at))
+            .sign_with_keys(keys)
+            .expect("sign merge authorization");
+        URL_SAFE_NO_PAD.encode(event.as_json().as_bytes())
+    }
+
+    fn valid_merge_authorization_request(now: u64) -> (HookCallbackRequest, Keys) {
+        let keys = Keys::generate();
+        let owner = keys.public_key().to_hex();
+        let mut req = make_request();
+        req.repo_id = "governed-repo".to_string();
+        req.repo_owner = owner.clone();
+        req.pusher_pubkey = owner.clone();
+        req.ref_updates[0].new_oid = "c".repeat(40);
+        req.ref_updates[0].merge_source_is_ancestor = true;
+        req.merge_authorization = encoded_merge_authorization(
+            &keys,
+            &format!("30617:{owner}:governed-repo"),
+            &"d".repeat(64),
+            "main",
+            &req.ref_updates[0].new_oid,
+            &req.ref_updates[0].new_oid,
+            now,
+        );
+        (req, keys)
+    }
+
+    #[test]
+    fn merge_authorization_claims_are_exact_and_signed() {
+        let now = 1_700_000_000;
+        let (req, _) = valid_merge_authorization_request(now);
+        let claims = parse_merge_authorization_claims(&req, now)
+            .expect("valid authorization")
+            .expect("authorization present");
+
+        assert_eq!(claims.authorization.ref_name, "refs/heads/main");
+        assert_eq!(claims.authorization.new_oid, "c".repeat(40));
+        assert_eq!(claims.pull_request_id, vec![0xdd; 32]);
+        assert_eq!(
+            claims.repo_address,
+            format!("30617:{}:governed-repo", req.repo_owner)
+        );
+        assert_eq!(claims.target_branch, "main");
+        assert_eq!(claims.source_commit, "c".repeat(40));
+    }
+
+    #[test]
+    fn merge_authorization_claims_reject_wrong_signer_pusher_repo_and_time() {
+        let now = 1_700_000_000;
+        let (valid, _) = valid_merge_authorization_request(now);
+
+        let mut wrong_signer = valid.clone();
+        let attacker = Keys::generate();
+        wrong_signer.merge_authorization = encoded_merge_authorization(
+            &attacker,
+            &format!("30617:{}:governed-repo", valid.repo_owner),
+            &"d".repeat(64),
+            "main",
+            &"c".repeat(40),
+            &"c".repeat(40),
+            now,
+        );
+        assert!(parse_merge_authorization_claims(&wrong_signer, now).is_err());
+
+        let mut wrong_pusher = valid.clone();
+        wrong_pusher.pusher_pubkey = "e".repeat(64);
+        assert!(parse_merge_authorization_claims(&wrong_pusher, now).is_err());
+
+        let mut wrong_repo = valid.clone();
+        wrong_repo.repo_id = "other-repo".to_string();
+        assert!(parse_merge_authorization_claims(&wrong_repo, now).is_err());
+
+        let mut expired = valid.clone();
+        let owner_keys = Keys::new(
+            nostr::SecretKey::from_hex(
+                // Re-signing requires the original key, so generate a fresh
+                // internally consistent request at the stale timestamp.
+                &"1".repeat(64),
+            )
+            .expect("test secret"),
+        );
+        let owner = owner_keys.public_key().to_hex();
+        expired.repo_owner = owner.clone();
+        expired.pusher_pubkey = owner.clone();
+        expired.merge_authorization = encoded_merge_authorization(
+            &owner_keys,
+            &format!("30617:{owner}:governed-repo"),
+            &"d".repeat(64),
+            "main",
+            &"c".repeat(40),
+            &"c".repeat(40),
+            now - GIT_MERGE_AUTHORIZATION_MAX_AGE_SECS - 1,
+        );
+        assert!(parse_merge_authorization_claims(&expired, now).is_err());
+
+        let mut future = expired;
+        future.merge_authorization = encoded_merge_authorization(
+            &owner_keys,
+            &format!("30617:{owner}:governed-repo"),
+            &"d".repeat(64),
+            "main",
+            &"c".repeat(40),
+            &"c".repeat(40),
+            now + 31,
+        );
+        assert!(parse_merge_authorization_claims(&future, now).is_err());
+    }
+
+    #[test]
+    fn merge_authorization_claims_reject_malformed_or_ambiguous_tags() {
+        let now = 1_700_000_000;
+        let (mut req, keys) = valid_merge_authorization_request(now);
+        let repo_address = format!("30617:{}:governed-repo", req.repo_owner);
+        let commit = "c".repeat(40);
+        let root = "d".repeat(64);
+
+        let cases = vec![
+            vec![
+                vec!["e", root.as_str(), "", "root"],
+                vec!["a", repo_address.as_str()],
+                vec!["source-commit", commit.as_str()],
+                vec!["merge-commit", commit.as_str()],
+                vec!["r", "e000000000000000000000000000000000000000"],
+                vec!["target-branch", "main"],
+            ],
+            vec![
+                vec!["e", root.as_str(), "", "root"],
+                vec!["a", repo_address.as_str()],
+                vec!["source-commit", commit.as_str()],
+                vec!["merge-commit", commit.as_str()],
+                vec!["r", commit.as_str()],
+                vec!["target-branch", "main"],
+                vec!["target-branch", "release"],
+            ],
+            vec![
+                vec!["e", root.as_str(), "", "root"],
+                vec!["e", root.as_str(), "", "root"],
+                vec!["a", repo_address.as_str()],
+                vec!["source-commit", commit.as_str()],
+                vec!["merge-commit", commit.as_str()],
+                vec!["r", commit.as_str()],
+                vec!["target-branch", "main"],
+            ],
+            vec![
+                vec!["e", root.as_str(), "", "root"],
+                vec!["a", repo_address.as_str()],
+                vec!["source-commit", commit.as_str()],
+                vec!["source-commit", "e000000000000000000000000000000000000000"],
+                vec!["merge-commit", commit.as_str()],
+                vec!["r", commit.as_str()],
+                vec!["target-branch", "main"],
+            ],
+        ];
+
+        for raw_tags in cases {
+            let tags = raw_tags
+                .into_iter()
+                .map(|tag| Tag::parse(tag).expect("valid test tag"))
+                .collect::<Vec<_>>();
+            let event = EventBuilder::new(Kind::Custom(1631), "")
+                .tags(tags)
+                .custom_created_at(Timestamp::from(now))
+                .sign_with_keys(&keys)
+                .expect("sign malformed claim");
+            req.merge_authorization = URL_SAFE_NO_PAD.encode(event.as_json().as_bytes());
+            assert!(parse_merge_authorization_claims(&req, now).is_err());
+        }
     }
 
     #[test]
@@ -566,6 +954,15 @@ mod tests {
     }
 
     #[test]
+    fn hmac_tampered_merge_source_is_ancestor_rejected() {
+        let secret = b"test-secret";
+        let mut req = make_request();
+        sign_request(&mut req, secret);
+        req.ref_updates[0].merge_source_is_ancestor = true;
+        assert!(!verify_hmac(secret, &req));
+    }
+
+    #[test]
     fn hmac_tampered_owner_rejected() {
         let secret = b"test-secret";
         let mut req = make_request();
@@ -604,6 +1001,16 @@ mod tests {
     }
 
     #[test]
+    fn hmac_tampered_merge_authorization_rejected() {
+        let secret = b"test-secret";
+        let mut req = make_request();
+        req.merge_authorization = "abc_DEF-123".to_string();
+        sign_request(&mut req, secret);
+        req.merge_authorization.push('x');
+        assert!(!verify_hmac(secret, &req));
+    }
+
+    #[test]
     fn hmac_deterministic_across_ref_order() {
         let secret = b"test-secret";
         let mut req1 = make_request();
@@ -612,6 +1019,7 @@ mod tests {
             new_oid: "4".repeat(40),
             ref_name: "refs/heads/develop".to_string(),
             is_ancestor: false,
+            merge_source_is_ancestor: false,
         });
         let mut req2 = req1.clone();
         // Reverse the ref order — HMAC should be the same (sorted internally).
@@ -651,6 +1059,7 @@ mod tests {
         let repo_owner = "ab".repeat(32); // 64 hex chars
         let pusher = "cd".repeat(32); // 64 hex chars
         let community_id = uuid::Uuid::from_u128(1).to_string();
+        let merge_authorization = "abc_DEF-123";
         let timestamp: u64 = 1700000000;
 
         // Two refs, intentionally out of sorted order to test sorting.
@@ -660,25 +1069,29 @@ mod tests {
                 new_oid: "c".repeat(40),
                 ref_name: "refs/heads/main".to_string(),
                 is_ancestor: true,
+                merge_source_is_ancestor: true,
             },
             HookRefUpdate {
                 old_oid: "a".repeat(40),
                 new_oid: "d".repeat(40),
                 ref_name: "refs/heads/feature".to_string(),
                 is_ancestor: false,
+                merge_source_is_ancestor: false,
             },
         ];
 
         // Compute Rust-side HMAC.
-        let rust_sig = generate_hook_hmac(
-            secret.as_bytes(),
-            repo_id,
-            &repo_owner,
-            &community_id,
-            &pusher,
-            &ref_updates,
+        let rust_req = HookCallbackRequest {
+            repo_id: repo_id.to_string(),
+            repo_owner: repo_owner.clone(),
+            community_id: community_id.clone(),
+            pusher_pubkey: pusher.clone(),
+            ref_updates: ref_updates.clone(),
+            merge_authorization: merge_authorization.to_string(),
             timestamp,
-        );
+            signature: String::new(),
+        };
+        let rust_sig = hex::encode(compute_hmac(secret.as_bytes(), &rust_req));
 
         // Bash script that replicates the hook's HMAC computation.
         // This is the exact logic from hook.rs PRE_RECEIVE_HOOK, extracted into
@@ -691,6 +1104,7 @@ BUZZ_REPO_OWNER="{repo_owner}"
 BUZZ_COMMUNITY_ID="{community_id}"
 BUZZ_PUSHER_PUBKEY="{pusher}"
 BUZZ_HOOK_SECRET="{secret}"
+BUZZ_MERGE_AUTHORIZATION="{merge_authorization}"
 TIMESTAMP="{timestamp}"
 
 # Simulate the HMAC_FILE with two refs (unsorted, like the hook writes them)
@@ -699,17 +1113,18 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 HMAC_FILE="$WORK_DIR/hmac"
 
 # Write refs in the order they'd arrive (main first, feature second)
-echo "refs/heads/main {old1} {new1} 1" >> "$HMAC_FILE"
-echo "refs/heads/feature {old2} {new2} 0" >> "$HMAC_FILE"
+echo "refs/heads/main {old1} {new1} 1 1" >> "$HMAC_FILE"
+echo "refs/heads/feature {old2} {new2} 0 0" >> "$HMAC_FILE"
 
 # Build HMAC input — exact logic from hook script
 REPO_ID_LEN=${{#BUZZ_REPO_ID}}
 HMAC_INPUT="${{REPO_ID_LEN}}:${{BUZZ_REPO_ID}}|${{BUZZ_REPO_OWNER}}|${{BUZZ_COMMUNITY_ID}}|${{BUZZ_PUSHER_PUBKEY}}|"
-sort "$HMAC_FILE" | while IFS=' ' read -r ref_name old_oid new_oid is_anc; do
+sort "$HMAC_FILE" | while IFS=' ' read -r ref_name old_oid new_oid is_anc merge_source_is_anc; do
     REF_LEN=${{#ref_name}}
-    printf '%s%s%s:%s%s' "$old_oid" "$new_oid" "$REF_LEN" "$ref_name" "$is_anc"
+    printf '%s%s%s:%s%s%s' "$old_oid" "$new_oid" "$REF_LEN" "$ref_name" "$is_anc" "$merge_source_is_anc"
 done > "$HMAC_FILE.concat"
-HMAC_INPUT="${{HMAC_INPUT}}$(cat "$HMAC_FILE.concat")|${{TIMESTAMP}}"
+MERGE_AUTH_LEN=${{#BUZZ_MERGE_AUTHORIZATION}}
+HMAC_INPUT="${{HMAC_INPUT}}$(cat "$HMAC_FILE.concat")|${{MERGE_AUTH_LEN}}:${{BUZZ_MERGE_AUTHORIZATION}}|${{TIMESTAMP}}"
 
 # Compute HMAC-SHA256
 printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "$BUZZ_HOOK_SECRET" -hex 2>/dev/null | sed 's/.*= //'
@@ -719,6 +1134,7 @@ printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "$BUZZ_HOOK_SECRET" -hex 
             community_id = community_id,
             pusher = pusher,
             secret = secret,
+            merge_authorization = merge_authorization,
             timestamp = timestamp,
             old1 = "b".repeat(40),
             new1 = "c".repeat(40),
@@ -762,6 +1178,7 @@ printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "$BUZZ_HOOK_SECRET" -hex 
             new_oid: "2".repeat(40),
             ref_name: "refs/heads/main".to_string(),
             is_ancestor: true,
+            merge_source_is_ancestor: false,
         }];
 
         let rust_sig = generate_hook_hmac(
@@ -780,15 +1197,15 @@ export LC_ALL=C
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
 HMAC_FILE="$WORK_DIR/hmac"
-echo "refs/heads/main {old} {new} 1" >> "$HMAC_FILE"
+echo "refs/heads/main {old} {new} 1 0" >> "$HMAC_FILE"
 BUZZ_REPO_ID="{repo_id}"
 REPO_ID_LEN=${{#BUZZ_REPO_ID}}
 HMAC_INPUT="${{REPO_ID_LEN}}:${{BUZZ_REPO_ID}}|{owner}|{community_id}|{pusher}|"
-sort "$HMAC_FILE" | while IFS=' ' read -r ref_name old_oid new_oid is_anc; do
+sort "$HMAC_FILE" | while IFS=' ' read -r ref_name old_oid new_oid is_anc merge_source_is_anc; do
     REF_LEN=${{#ref_name}}
-    printf '%s%s%s:%s%s' "$old_oid" "$new_oid" "$REF_LEN" "$ref_name" "$is_anc"
+    printf '%s%s%s:%s%s%s' "$old_oid" "$new_oid" "$REF_LEN" "$ref_name" "$is_anc" "$merge_source_is_anc"
 done > "$HMAC_FILE.concat"
-HMAC_INPUT="${{HMAC_INPUT}}$(cat "$HMAC_FILE.concat")|{timestamp}"
+HMAC_INPUT="${{HMAC_INPUT}}$(cat "$HMAC_FILE.concat")|0:|{timestamp}"
 printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "{secret}" -hex 2>/dev/null | sed 's/.*= //'
 "#,
             old = "1".repeat(40),
@@ -900,7 +1317,9 @@ printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "{secret}" -hex 2>/dev/nu
                 new_oid: "2".repeat(40),
                 ref_name: "refs/heads/main".to_string(),
                 is_ancestor: false,
+                merge_source_is_ancestor: false,
             }],
+            merge_authorization: String::new(),
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -918,6 +1337,15 @@ printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "{secret}" -hex 2>/dev/nu
             .await
             .expect("read body");
         (status, String::from_utf8(bytes.to_vec()).expect("utf-8"))
+    }
+
+    async fn signed_policy_response(
+        state: &Arc<AppState>,
+        mut req: HookCallbackRequest,
+    ) -> axum::response::Response {
+        let secret = state.config.git_hook_hmac_secret.clone();
+        sign_request(&mut req, secret.as_bytes());
+        hook_policy_check(State(Arc::clone(state)), Json(req)).await
     }
 
     /// The tri-state trap the resolver exists to prevent: a broken (malformed
@@ -983,5 +1411,122 @@ printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "{secret}" -hex 2>/dev/nu
             StatusCode::OK,
             "owner push to a never-bound repo must remain allowed (got body: {body})"
         );
+    }
+
+    /// Full database-backed governance seam: the repository announcement,
+    /// pull request and owner-signed merged status must agree exactly before
+    /// `require-patch` admits the fast-forward. The quarantined Git check must
+    /// additionally prove that the PR head is an ancestor of the pushed result.
+    /// Missing proof, an unrelated PR head, a commit mismatch and a
+    /// non-fast-forward all remain denied.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn require_patch_accepts_only_exact_owner_signed_pull_request_merge() {
+        let state = policy_test_state().await;
+        let host = format!("policy-{}.example", uuid::Uuid::new_v4().simple());
+        let community = state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("community")
+            .id;
+        let owner_keys = Keys::generate();
+        let owner = owner_keys.public_key().to_hex();
+        let author_keys = Keys::generate();
+        let repo_id = format!("repo-{}", uuid::Uuid::new_v4().simple());
+        let repo_address = format!("30617:{owner}:{repo_id}");
+        let old_oid = "a".repeat(40);
+        let source_oid = "b".repeat(40);
+        let new_oid = "c".repeat(40);
+
+        let repo_event = EventBuilder::new(Kind::Custom(30617), "")
+            .tags(vec![
+                Tag::parse(["d", repo_id.as_str()]).unwrap(),
+                Tag::parse([
+                    "buzz-protect",
+                    "refs/heads/main",
+                    "push:admin",
+                    "no-force-push",
+                    "no-delete",
+                    "require-patch",
+                ])
+                .unwrap(),
+            ])
+            .sign_with_keys(&owner_keys)
+            .expect("sign repository announcement");
+        state
+            .db
+            .insert_event(community, &repo_event, None)
+            .await
+            .expect("insert repository announcement");
+
+        let pull_request = EventBuilder::new(Kind::Custom(1618), "merge proposal")
+            .tags(vec![
+                Tag::parse(["a", repo_address.as_str()]).unwrap(),
+                Tag::parse(["p", owner.as_str()]).unwrap(),
+                Tag::parse(["c", source_oid.as_str()]).unwrap(),
+                Tag::parse(["target-branch", "main"]).unwrap(),
+            ])
+            .sign_with_keys(&author_keys)
+            .expect("sign pull request");
+        state
+            .db
+            .insert_event(community, &pull_request, None)
+            .await
+            .expect("insert pull request");
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let authorization = encoded_merge_authorization(
+            &owner_keys,
+            &repo_address,
+            &pull_request.id.to_hex(),
+            "main",
+            &source_oid,
+            &new_oid,
+            now,
+        );
+        let base_request = HookCallbackRequest {
+            repo_id: repo_id.clone(),
+            repo_owner: owner.clone(),
+            community_id: community.as_uuid().to_string(),
+            pusher_pubkey: owner,
+            ref_updates: vec![HookRefUpdate {
+                old_oid,
+                new_oid: new_oid.clone(),
+                ref_name: "refs/heads/main".to_string(),
+                is_ancestor: true,
+                merge_source_is_ancestor: true,
+            }],
+            merge_authorization: authorization,
+            timestamp: now,
+            signature: String::new(),
+        };
+
+        let (status, body) =
+            body_string(signed_policy_response(&state, base_request.clone()).await).await;
+        assert_eq!(status, StatusCode::OK, "exact proof must pass: {body}");
+
+        let mut missing = base_request.clone();
+        missing.merge_authorization.clear();
+        let (status, _) = body_string(signed_policy_response(&state, missing).await).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let mut unrelated_source = base_request.clone();
+        unrelated_source.ref_updates[0].merge_source_is_ancestor = false;
+        let (status, _) = body_string(signed_policy_response(&state, unrelated_source).await).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let mut wrong_commit = base_request.clone();
+        wrong_commit.ref_updates[0].new_oid = "d".repeat(40);
+        let (status, _) = body_string(signed_policy_response(&state, wrong_commit).await).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let mut non_fast_forward = base_request;
+        non_fast_forward.ref_updates[0].is_ancestor = false;
+        let (status, _) = body_string(signed_policy_response(&state, non_fast_forward).await).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 }

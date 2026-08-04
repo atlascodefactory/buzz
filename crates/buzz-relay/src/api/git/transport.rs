@@ -38,6 +38,9 @@ use super::hydrate::{
 };
 use super::manifest_event::{build_ref_state_event, RefStateInputs};
 use crate::state::AppState;
+use buzz_core::git_perms::{
+    GIT_MERGE_AUTHORIZATION_HEADER, GIT_MERGE_AUTHORIZATION_MAX_ENCODED_BYTES,
+};
 use buzz_core::TenantContext;
 
 /// Timeout for `info/refs` — ref advertisement is fast (essentially `git show-ref`).
@@ -1028,6 +1031,80 @@ fn missing_receive_pack_auth_response() -> Response {
         .unwrap()
 }
 
+fn merge_authorization_header(
+    headers: &axum::http::HeaderMap,
+) -> Result<String, (StatusCode, &'static str)> {
+    let mut values = headers.get_all(GIT_MERGE_AUTHORIZATION_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(String::new());
+    };
+    if values.next().is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "duplicate merge authorization header",
+        ));
+    }
+    let value = value.to_str().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "invalid merge authorization header",
+        )
+    })?;
+    if value.is_empty()
+        || value.len() > GIT_MERGE_AUTHORIZATION_MAX_ENCODED_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid merge authorization header",
+        ));
+    }
+    Ok(value.to_string())
+}
+
+/// Extract the PR head that the pre-receive hook must prove is contained in
+/// the pushed result. This is not the authorization decision: the policy
+/// endpoint independently verifies the event signature and binds the same tag
+/// to the stored PR. Parsing here only supplies a safe, proof-derived Git OID
+/// to the quarantined ancestry check.
+fn merge_authorization_source_commit(encoded: &str) -> Result<String, (StatusCode, &'static str)> {
+    if encoded.is_empty() {
+        return Ok(String::new());
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded.as_bytes())
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid merge authorization proof"))?;
+    let event: nostr::Event = serde_json::from_slice(&bytes)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid merge authorization proof"))?;
+    let mut values = event.tags.iter().filter_map(|tag| {
+        let parts = tag.as_slice();
+        (parts.first().map(String::as_str) == Some("source-commit"))
+            .then(|| parts.get(1).map(String::as_str))
+            .flatten()
+    });
+    let source_commit = values
+        .next()
+        .filter(|value| {
+            value.len() == 40
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "merge authorization has no valid source commit",
+        ))?;
+    if values.next().is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "merge authorization has ambiguous source commits",
+        ));
+    }
+    Ok(source_commit.to_string())
+}
+
 /// Answer only stock Git's content-free large-request probe.
 ///
 /// This intentionally runs before repo-name validation, tenant binding,
@@ -1105,6 +1182,10 @@ pub async fn receive_pack(
     };
 
     let repo_name = validate_repo_id(&params.owner, &params.repo)?;
+    let merge_authorization =
+        merge_authorization_header(&headers).map_err(IntoResponse::into_response)?;
+    let merge_source_commit = merge_authorization_source_commit(&merge_authorization)
+        .map_err(IntoResponse::into_response)?;
     let body = decode_git_request_body(&headers, body, state.config.git_max_pack_bytes);
     let pusher_hex = hex::encode(auth.pubkey.to_bytes());
     let _permit = acquire_git_permit(&state, "receive_pack")?;
@@ -1169,6 +1250,8 @@ pub async fn receive_pack(
             auth.tenant.community().as_uuid().to_string(),
         ),
         ("BUZZ_PUSHER_PUBKEY", pusher_hex.clone()),
+        ("BUZZ_MERGE_AUTHORIZATION", merge_authorization),
+        ("BUZZ_MERGE_SOURCE_COMMIT", merge_source_commit),
         // Override any repo-local core.hooksPath setting; defense in
         // depth even though the hydrated workspace has no inherited
         // config.
@@ -2010,6 +2093,7 @@ pub fn git_router(state: Arc<AppState>) -> Router {
 mod receive_pack_probe_tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
+    use nostr::{EventBuilder, Keys, Kind, Tag};
 
     fn probe_headers(content_type: Option<&str>) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -2020,6 +2104,98 @@ mod receive_pack_probe_tests {
             );
         }
         headers
+    }
+
+    #[test]
+    fn merge_authorization_header_is_absent_by_default() {
+        assert_eq!(
+            merge_authorization_header(&HeaderMap::new()).expect("absent header"),
+            ""
+        );
+    }
+
+    #[test]
+    fn merge_authorization_header_accepts_one_bounded_base64url_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            GIT_MERGE_AUTHORIZATION_HEADER,
+            HeaderValue::from_static("abc_DEF-123"),
+        );
+
+        assert_eq!(
+            merge_authorization_header(&headers).expect("valid header"),
+            "abc_DEF-123"
+        );
+    }
+
+    #[test]
+    fn merge_authorization_header_rejects_ambiguous_or_unsafe_values() {
+        for value in ["", "abc=", "abc/def", "abc def"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                GIT_MERGE_AUTHORIZATION_HEADER,
+                HeaderValue::from_str(value).expect("representable header"),
+            );
+            assert!(
+                merge_authorization_header(&headers).is_err(),
+                "value {value:?} must be rejected"
+            );
+        }
+
+        let mut duplicate = HeaderMap::new();
+        duplicate.append(
+            GIT_MERGE_AUTHORIZATION_HEADER,
+            HeaderValue::from_static("first"),
+        );
+        duplicate.append(
+            GIT_MERGE_AUTHORIZATION_HEADER,
+            HeaderValue::from_static("second"),
+        );
+        assert!(merge_authorization_header(&duplicate).is_err());
+
+        let mut oversized = HeaderMap::new();
+        oversized.insert(
+            GIT_MERGE_AUTHORIZATION_HEADER,
+            HeaderValue::from_str(&"a".repeat(GIT_MERGE_AUTHORIZATION_MAX_ENCODED_BYTES + 1))
+                .expect("representable header"),
+        );
+        assert!(merge_authorization_header(&oversized).is_err());
+    }
+
+    fn encoded_merge_proof(source_tags: &[&str]) -> String {
+        let tags = source_tags
+            .iter()
+            .map(|source| Tag::parse(["source-commit", *source]).expect("source tag"))
+            .collect::<Vec<_>>();
+        let event = EventBuilder::new(Kind::Custom(1631), "")
+            .tags(tags)
+            .sign_with_keys(&Keys::generate())
+            .expect("signed event");
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&event).expect("event json"))
+    }
+
+    #[test]
+    fn merge_authorization_source_commit_is_unique_lowercase_sha1() {
+        let source = "a".repeat(40);
+        let encoded = encoded_merge_proof(&[source.as_str()]);
+        assert_eq!(
+            merge_authorization_source_commit(&encoded).expect("valid source commit"),
+            source
+        );
+        assert_eq!(
+            merge_authorization_source_commit("").expect("ordinary push"),
+            ""
+        );
+
+        for invalid in [
+            encoded_merge_proof(&[]),
+            encoded_merge_proof(&[&"b".repeat(40), &"c".repeat(40)]),
+            encoded_merge_proof(&[&"A".repeat(40)]),
+            encoded_merge_proof(&["not-a-commit"]),
+        ] {
+            assert!(merge_authorization_source_commit(&invalid).is_err());
+        }
     }
 
     #[tokio::test]

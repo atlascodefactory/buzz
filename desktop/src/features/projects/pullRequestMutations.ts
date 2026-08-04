@@ -81,6 +81,9 @@ export function projectPullRequestMergedTags(
   pullRequest: ProjectPullRequest,
   mergeCommit: string,
 ): string[][] {
+  if (!pullRequest.commit) {
+    throw new Error("Cannot record a merge without the pull request commit.");
+  }
   return [
     ["e", pullRequest.id, "", "root"],
     ["a", project.repoAddress],
@@ -88,8 +91,10 @@ export function projectPullRequestMergedTags(
       "p",
       pubkey,
     ]),
+    ["source-commit", pullRequest.commit],
     ["merge-commit", mergeCommit],
     ["r", mergeCommit],
+    ["target-branch", pullRequest.targetBranch ?? project.defaultBranch],
   ];
 }
 

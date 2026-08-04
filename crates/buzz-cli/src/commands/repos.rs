@@ -91,6 +91,15 @@ enum RepoChange {
     BindChannel(String),
 }
 
+fn next_repo_update_created_at(existing: &Event, now: u64) -> Result<u64, CliError> {
+    let monotonic = existing
+        .created_at
+        .as_secs()
+        .checked_add(1)
+        .ok_or_else(|| CliError::Other("repository timestamp cannot be advanced".into()))?;
+    Ok(monotonic.max(now))
+}
+
 fn build_updated_repo_announcement(
     existing: &Event,
     change: RepoChange,
@@ -141,13 +150,11 @@ fn build_updated_repo_announcement(
         ))
     })?;
 
-    // Advance only the observed head. Using wall-clock time here would let a
-    // delayed writer leapfrog an intervening update and silently erase metadata.
-    let next_created_at = existing
-        .created_at
-        .as_secs()
-        .checked_add(1)
-        .ok_or_else(|| CliError::Other("repository timestamp cannot be advanced".into()))?;
+    // Parameterized replaceable events must advance the observed head, while
+    // the relay also requires a fresh timestamp. The command fetches the latest
+    // announcement immediately before this build; max preserves monotonicity
+    // for rapid consecutive updates and refreshes older announcements.
+    let next_created_at = next_repo_update_created_at(existing, Timestamp::now().as_secs())?;
     buzz_sdk::build_repo_announcement_with_tags(repo_id, &existing.content, tags)
         .map_err(|error| CliError::Other(format!("failed to build repository update: {error}")))
         .map(|builder| builder.custom_created_at(Timestamp::from(next_created_at)))
@@ -478,7 +485,7 @@ mod tests {
 
     use super::{
         build_create_announcement, build_protection_tag, build_updated_repo_announcement,
-        protection_rules_json, validate_write_response, RepoChange,
+        next_repo_update_created_at, protection_rules_json, validate_write_response, RepoChange,
     };
 
     fn signed_repo(tags: Vec<Tag>, content: &str, created_at: u64) -> nostr::Event {
@@ -520,7 +527,7 @@ mod tests {
         .expect("sign update");
 
         assert_eq!(updated.content, "repository content");
-        assert_eq!(updated.created_at.as_secs(), 101);
+        assert!(updated.created_at.as_secs() > existing.created_at.as_secs());
         assert!(!updated
             .tags
             .iter()
@@ -714,7 +721,7 @@ mod tests {
                 .expect("sign bind update");
 
         assert_eq!(updated.content, "repository content");
-        assert_eq!(updated.created_at.as_secs(), 101);
+        assert!(updated.created_at.as_secs() > existing.created_at.as_secs());
         // Exactly one binding remains, and it is the requested one.
         let bindings: Vec<_> = updated
             .tags
@@ -757,6 +764,18 @@ mod tests {
             .tags
             .iter()
             .any(|tag| tag.as_slice() == ["buzz-channel", channel.as_str()]));
+    }
+
+    #[test]
+    fn repository_updates_are_both_fresh_and_monotonic() {
+        let old = signed_repo(vec![tag(&["d", "demo"])], "", 100);
+        assert_eq!(next_repo_update_created_at(&old, 10_000).unwrap(), 10_000);
+
+        let future = signed_repo(vec![tag(&["d", "demo"])], "", 10_005);
+        assert_eq!(
+            next_repo_update_created_at(&future, 10_000).unwrap(),
+            10_006
+        );
     }
 
     #[test]
