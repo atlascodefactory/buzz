@@ -88,7 +88,7 @@ test("projectPullRequestUpdateTags uses uppercase NIP-22 root tags", () => {
 test("projectPullRequestMergedTags records the pushed merge commit", () => {
   const tags = projectPullRequestMergedTags(
     project,
-    { id: PR_ID, author: AUTHOR },
+    { id: PR_ID, author: AUTHOR, targetBranch: "main", commit: COMMIT },
     COMMIT,
   );
 
@@ -97,7 +97,9 @@ test("projectPullRequestMergedTags records the pushed merge commit", () => {
     ["a", project.repoAddress],
     ["p", OWNER],
     ["p", AUTHOR],
+    ["source-commit", COMMIT],
     ["merge-commit", COMMIT],
     ["r", COMMIT],
+    ["target-branch", "main"],
   ]);
 });

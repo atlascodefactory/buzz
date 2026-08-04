@@ -260,6 +260,35 @@ pub struct RefUpdate {
     pub new_oid: String,
 }
 
+/// A signed NIP-34 merge authorization bound to one exact ref update.
+///
+/// The relay only constructs this after verifying the repository owner's
+/// signature, repository coordinate, pull-request root, target branch, commit,
+/// and freshness. Keeping the policy input this small prevents transport or UI
+/// details from leaking into the pure permission engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchAuthorization {
+    /// Full ref name authorized by the merge event.
+    pub ref_name: String,
+    /// Exact new commit authorized by the merge event.
+    pub new_oid: String,
+}
+
+impl PatchAuthorization {
+    fn matches(&self, update: &RefUpdate) -> bool {
+        update.kind == UpdateKind::FastForward
+            && self.ref_name == update.ref_name
+            && self.new_oid.eq_ignore_ascii_case(&update.new_oid)
+    }
+}
+
+/// HTTP header carrying the short-lived, owner-signed NIP-34 merge proof.
+pub const GIT_MERGE_AUTHORIZATION_HEADER: &str = "x-buzz-merge-authorization";
+/// Bound the proof before it crosses the Git hook environment and callback.
+pub const GIT_MERGE_AUTHORIZATION_MAX_ENCODED_BYTES: usize = 8 * 1024;
+/// A merge proof is deliberately short-lived and exact-ref/exact-commit bound.
+pub const GIT_MERGE_AUTHORIZATION_MAX_AGE_SECS: u64 = 5 * 60;
+
 /// A single protection rule parsed from a `buzz-protect` tag on kind:30617.
 ///
 /// Format: `["buzz-protect", "<ref-pattern>", "<rule>", ...]`
@@ -276,10 +305,9 @@ pub struct ProtectionRule {
     pub no_delete: bool,
     /// Whether direct push is denied (must use NIP-34 patch).
     ///
-    /// NOTE: This blocks ALL ref update kinds (create, FF, NFF, delete) — not just
-    /// fast-forward pushes. If set on a ref pattern, that ref can only be modified
-    /// via the NIP-34 patch workflow. This is intentional: the ref is fully governed
-    /// by the patch review process.
+    /// Without an exact relay-verified NIP-34 merge authorization this blocks all
+    /// ref update kinds. A valid proof permits only the authorized fast-forward;
+    /// create, delete and non-fast-forward updates remain denied.
     pub require_patch: bool,
 }
 
@@ -534,6 +562,16 @@ pub fn evaluate_ref_update(
     role: MemberRole,
     rules: &[ProtectionRule],
 ) -> Result<(), Denial> {
+    evaluate_ref_update_with_patch_authorizations(update, role, rules, &[])
+}
+
+/// Evaluate one ref update with verified NIP-34 merge authorizations.
+pub fn evaluate_ref_update_with_patch_authorizations(
+    update: &RefUpdate,
+    role: MemberRole,
+    rules: &[ProtectionRule],
+    patch_authorizations: &[PatchAuthorization],
+) -> Result<(), Denial> {
     let effective = EffectiveRules::for_ref(&update.ref_name, rules);
 
     // If no explicit rules match, use built-in defaults.
@@ -551,11 +589,19 @@ pub fn evaluate_ref_update(
         return Ok(());
     }
 
-    // Check require-patch (blocks all direct pushes).
-    if effective.require_patch {
+    // `require-patch` permits only an exact, verified NIP-34 merge proof. The
+    // proof itself is restricted to fast-forwards, so it can never authorize a
+    // create, deletion, or non-fast-forward update.
+    if effective.require_patch
+        && !patch_authorizations
+            .iter()
+            .any(|authorization| authorization.matches(update))
+    {
         return Err(Denial {
             ref_name: update.ref_name.clone(),
-            reason: "direct push denied: require-patch is set, submit a NIP-34 patch".to_string(),
+            reason:
+                "direct push denied: require-patch is set; merge an authorized NIP-34 pull request"
+                    .to_string(),
         });
     }
 
@@ -610,9 +656,22 @@ pub fn evaluate_push(
     role: MemberRole,
     rules: &[ProtectionRule],
 ) -> Result<(), Vec<Denial>> {
+    evaluate_push_with_patch_authorizations(updates, role, rules, &[])
+}
+
+/// Evaluate an atomic push with verified NIP-34 merge authorizations.
+pub fn evaluate_push_with_patch_authorizations(
+    updates: &[RefUpdate],
+    role: MemberRole,
+    rules: &[ProtectionRule],
+    patch_authorizations: &[PatchAuthorization],
+) -> Result<(), Vec<Denial>> {
     let denials: Vec<Denial> = updates
         .iter()
-        .filter_map(|update| evaluate_ref_update(update, role, rules).err())
+        .filter_map(|update| {
+            evaluate_ref_update_with_patch_authorizations(update, role, rules, patch_authorizations)
+                .err()
+        })
         .collect();
 
     if denials.is_empty() {
@@ -882,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_require_patch_blocks_all() {
+    fn evaluate_require_patch_blocks_without_authorization() {
         let rules = vec![parse_protection_tag(&["refs/heads/main", "require-patch"]).unwrap()];
         let update = RefUpdate {
             ref_name: "refs/heads/main".to_string(),
@@ -891,6 +950,85 @@ mod tests {
             new_oid: "b".repeat(40),
         };
         assert!(evaluate_ref_update(&update, MemberRole::Owner, &rules).is_err());
+    }
+
+    #[test]
+    fn evaluate_require_patch_allows_exact_authorized_fast_forward() {
+        let rules = vec![parse_protection_tag(&[
+            "refs/heads/main",
+            "push:admin",
+            "no-force-push",
+            "no-delete",
+            "require-patch",
+        ])
+        .unwrap()];
+        let update = RefUpdate {
+            ref_name: "refs/heads/main".to_string(),
+            kind: UpdateKind::FastForward,
+            old_oid: "a".repeat(40),
+            new_oid: "b".repeat(40),
+        };
+        let authorization = PatchAuthorization {
+            ref_name: update.ref_name.clone(),
+            new_oid: update.new_oid.clone(),
+        };
+
+        assert!(evaluate_ref_update_with_patch_authorizations(
+            &update,
+            MemberRole::Owner,
+            &rules,
+            &[authorization]
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn evaluate_require_patch_rejects_wrong_ref_commit_and_non_fast_forward() {
+        let rules =
+            vec![
+                parse_protection_tag(&["refs/heads/main", "no-force-push", "require-patch"])
+                    .unwrap(),
+            ];
+        let fast_forward = RefUpdate {
+            ref_name: "refs/heads/main".to_string(),
+            kind: UpdateKind::FastForward,
+            old_oid: "a".repeat(40),
+            new_oid: "b".repeat(40),
+        };
+        for authorization in [
+            PatchAuthorization {
+                ref_name: "refs/heads/release".to_string(),
+                new_oid: "b".repeat(40),
+            },
+            PatchAuthorization {
+                ref_name: "refs/heads/main".to_string(),
+                new_oid: "c".repeat(40),
+            },
+        ] {
+            assert!(evaluate_ref_update_with_patch_authorizations(
+                &fast_forward,
+                MemberRole::Owner,
+                &rules,
+                &[authorization],
+            )
+            .is_err());
+        }
+
+        let non_fast_forward = RefUpdate {
+            kind: UpdateKind::NonFastForward,
+            ..fast_forward
+        };
+        let exact_authorization = PatchAuthorization {
+            ref_name: non_fast_forward.ref_name.clone(),
+            new_oid: non_fast_forward.new_oid.clone(),
+        };
+        assert!(evaluate_ref_update_with_patch_authorizations(
+            &non_fast_forward,
+            MemberRole::Owner,
+            &rules,
+            &[exact_authorization],
+        )
+        .is_err());
     }
 
     #[test]
