@@ -110,7 +110,11 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for ReceivePackAuth {
         parts: &mut axum::http::request::Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        if parts.headers.contains_key(header::AUTHORIZATION) {
+        // Restricted NIP-FI modes must retain GitAuth's admission and denial
+        // contract even when NIP-98 is missing. The content-free stock-Git
+        // probe exception applies only while federation is not enforced.
+        if state.config.nip_fi.mode.restricts() || parts.headers.contains_key(header::AUTHORIZATION)
+        {
             <GitAuth as axum::extract::FromRequestParts<Arc<AppState>>>::from_request_parts(
                 parts, state,
             )
