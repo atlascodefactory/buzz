@@ -734,6 +734,22 @@ pub enum ChannelsCmd {
         #[arg(long)]
         role: Option<String>,
     },
+    /// Atomically admit a bot only while a required identity remains a member
+    #[command(name = "admit-bot")]
+    AdmitBot {
+        /// Channel UUID
+        #[arg(long)]
+        channel: String,
+        /// Registered bot pubkey (64-char lowercase hex)
+        #[arg(long)]
+        pubkey: String,
+        /// Identity that must still be an active channel member
+        #[arg(long)]
+        required_member: String,
+        /// Current target state expected at commit: absent or bot
+        #[arg(long, value_parser = ["absent", "bot"])]
+        expected_role: String,
+    },
     /// Remove a member from a channel
     #[command(name = "remove-member")]
     RemoveMember {
@@ -2456,6 +2472,7 @@ mod tests {
             names(&cmd, "channels"),
             vec![
                 "add-member",
+                "admit-bot",
                 "archive",
                 "create",
                 "delete",
@@ -2581,7 +2598,7 @@ mod tests {
         let expected: Vec<(&str, usize)> = vec![
             ("agents", 5),
             ("canvas", 4),
-            ("channels", 16),
+            ("channels", 17),
             ("dms", 4),
             ("emoji", 5),
             ("feed", 1),

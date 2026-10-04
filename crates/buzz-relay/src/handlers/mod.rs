@@ -10,6 +10,8 @@ pub mod close;
 pub mod command_executor;
 /// Relay-operator community provisioning HTTP support.
 pub mod community_provisioning;
+/// Atomic, conditional channel admission for registered bots.
+pub mod conditional_membership;
 /// NIP-45 COUNT handler.
 pub mod count;
 /// EVENT handler — WS dispatcher → ingest pipeline → fan-out.

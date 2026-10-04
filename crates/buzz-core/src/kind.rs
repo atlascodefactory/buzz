@@ -345,6 +345,9 @@ pub const KIND_NIP29_CREATE_GROUP: u32 = 9007;
 pub const KIND_NIP29_DELETE_GROUP: u32 = 9008;
 /// NIP-29: Create an invite to a group.
 pub const KIND_NIP29_CREATE_INVITE: u32 = 9009;
+/// Buzz conditional bot admission; see `docs/nips/conditional-bot-admission.md`.
+/// Unlike kind 9000, the conditions and mutation commit atomically.
+pub const KIND_CONDITIONAL_BOT_ADMISSION: u32 = 9010;
 /// NIP-29: Request to join a group.
 pub const KIND_NIP29_JOIN_REQUEST: u32 = 9021;
 /// NIP-29: Request to leave a group.
@@ -674,6 +677,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_NIP29_CREATE_GROUP,
     KIND_NIP29_DELETE_GROUP,
     KIND_NIP29_CREATE_INVITE,
+    KIND_CONDITIONAL_BOT_ADMISSION,
     KIND_NIP29_JOIN_REQUEST,
     KIND_NIP29_LEAVE_REQUEST,
     KIND_MODERATION_BAN,
