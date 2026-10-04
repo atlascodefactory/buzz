@@ -1775,6 +1775,51 @@ pub async fn cmd_remove_channel_member(
     Ok(())
 }
 
+/// Submit the distinct conditional command; never fall back to kind 9000.
+pub async fn cmd_admit_bot(
+    client: &BuzzClient,
+    channel: &str,
+    pubkey: &str,
+    required_member: &str,
+    expected_role: &str,
+) -> Result<(), CliError> {
+    let channel = parse_uuid(channel)?.to_string();
+    for value in [pubkey, required_member] {
+        validate_hex64(value)?;
+        if value != value.to_ascii_lowercase() {
+            return Err(CliError::Usage("public keys must use lowercase hex".into()));
+        }
+    }
+    if !matches!(expected_role, "absent" | "bot") {
+        return Err(CliError::Usage(
+            "expected-role must be absent or bot".into(),
+        ));
+    }
+    let created_at = nostr::Timestamp::now();
+    let expiration = created_at.as_secs().saturating_add(60).to_string();
+    let tags = [
+        ["h", channel.as_str()],
+        ["p", pubkey],
+        ["role", "bot"],
+        ["required-member", required_member],
+        ["expected-role", expected_role],
+        ["expiration", expiration.as_str()],
+    ]
+    .into_iter()
+    .map(nostr::Tag::parse)
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|e| CliError::Usage(format!("invalid admission tags: {e}")))?;
+    let builder = nostr::EventBuilder::new(
+        nostr::Kind::Custom(buzz_core::kind::KIND_CONDITIONAL_BOT_ADMISSION as u16),
+        "",
+    )
+    .custom_created_at(created_at)
+    .tags(tags);
+    let response = client.submit_event(client.sign_event(builder)?).await?;
+    println!("{}", normalize_write_response(&response));
+    Ok(())
+}
+
 /// Set the channel addition policy — sign and submit a kind:10100 (agent profile) event.
 pub async fn cmd_set_add_policy(client: &BuzzClient, policy: &str) -> Result<(), CliError> {
     match policy {
@@ -1958,6 +2003,12 @@ pub async fn dispatch(
             pubkey,
             role,
         } => cmd_add_channel_member(client, &channel, &pubkey, role.as_deref()).await,
+        ChannelsCmd::AdmitBot {
+            channel,
+            pubkey,
+            required_member,
+            expected_role,
+        } => cmd_admit_bot(client, &channel, &pubkey, &required_member, &expected_role).await,
         ChannelsCmd::RemoveMember { channel, pubkey } => {
             cmd_remove_channel_member(client, &channel, &pubkey).await
         }
@@ -3326,6 +3377,9 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod conditional_bot_tests;
 
 /// Command-level coverage for `cmd_set_canvas`'s writer discipline: it must read
 /// the head, stamp `created_at` strictly ahead of a future-dated head, emit NO

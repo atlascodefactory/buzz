@@ -544,7 +544,8 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_FORUM_POST
         | KIND_FORUM_VOTE
         | KIND_FORUM_COMMENT => Ok(Scope::MessagesWrite),
-        KIND_NIP29_PUT_USER | KIND_NIP29_REMOVE_USER | KIND_NIP29_DELETE_GROUP => {
+        KIND_NIP29_PUT_USER | KIND_NIP29_REMOVE_USER | KIND_NIP29_DELETE_GROUP
+        | buzz_core::kind::KIND_CONDITIONAL_BOT_ADMISSION => {
             Ok(Scope::AdminChannels)
         }
         // NIP-43: relay membership admin commands (9030–9032) + Buzz
@@ -783,6 +784,7 @@ pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
             | KIND_FORUM_COMMENT
             // NIP-29 admin kinds (except CREATE_GROUP which creates the channel)
             | KIND_NIP29_PUT_USER
+            | buzz_core::kind::KIND_CONDITIONAL_BOT_ADMISSION
             | KIND_NIP29_REMOVE_USER
             | KIND_NIP29_EDIT_METADATA
             | KIND_NIP29_DELETE_EVENT
@@ -2847,6 +2849,35 @@ async fn ingest_event_inner(
     }
 
     validate_huddle_lifecycle_event(tenant, state, &event, kind_u32).await?;
+
+    // Do not use legacy post-storage side effects: they log failures after
+    // committing the command and therefore cannot provide a conditional ACK.
+    if kind_u32 == buzz_core::kind::KIND_CONDITIONAL_BOT_ADMISSION {
+        let scoped_channel = channel_id.ok_or_else(|| {
+            IngestError::Rejected("invalid: conditional admission requires a channel".into())
+        })?;
+        let result = super::conditional_membership::accept(tenant, state, &event).await?;
+        let channel = channel_label(scoped_channel);
+        let claimed_community = claimed_community_from_event(&event);
+        let msg_id = msg_id_label(event.id.as_bytes());
+        let action = if result.message == "duplicate:" {
+            TraceAction::WriteDuplicate {
+                msg_id,
+                channel,
+                claimed_community,
+            }
+        } else {
+            TraceAction::WriteInsert {
+                msg_id,
+                channel,
+                claimed_community,
+            }
+        };
+        emit(tracer, action, state_for_request(tenant, auth.pubkey()));
+        super::conditional_membership::publish_current_roster(tenant, state, scoped_channel)
+            .await?;
+        return Ok(result);
+    }
 
     if crate::handlers::side_effects::is_admin_kind(kind_u32) {
         crate::handlers::side_effects::validate_admin_event(tenant, kind_u32, &event, state)

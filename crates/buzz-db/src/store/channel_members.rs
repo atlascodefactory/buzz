@@ -32,6 +32,163 @@ pub struct MemberRecord {
     pub removed_at: Option<DateTime<Utc>>,
 }
 
+/// Conditions for an atomic bot admission, not a grant of ownership or authority.
+#[derive(Debug, Clone)]
+pub struct MemberAdmissionPrecondition {
+    /// This community-scoped identity must still be an active channel member.
+    pub required_member: Vec<u8>,
+    /// `None` expects no active target; only `Some(Bot)` is supported.
+    pub expected_role: Option<MemberRole>,
+    /// Checked using database wall-clock time after acquiring the writer locks.
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Persist a command and bot admission in the caller's transaction.
+///
+/// The caller must validate the signed kind-9010 envelope and authenticated
+/// identity/scope, acquire the community serving-write guard, and commit only
+/// on success. Membership, shared TTL and channel-row locks precede every
+/// mutable condition check. Existing roles
+/// are never overwritten. An exact event replay performs no membership write.
+/// Returns `true` for a newly committed command, `false` for an exact replay.
+pub async fn admit_bot_conditionally_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    event: &nostr::Event,
+    channel_id: Uuid,
+    target: &[u8],
+    precondition: &MemberAdmissionPrecondition,
+) -> Result<bool> {
+    if target.len() != 32
+        || precondition.required_member.len() != 32
+        || !matches!(precondition.expected_role, None | Some(MemberRole::Bot))
+    {
+        return Err(DbError::InvalidData(
+            "invalid bot admission conditions".into(),
+        ));
+    }
+    // Roster publishers hold membership while the deferred event trigger may
+    // UPDATE the channel. TTL transitions take TTL exclusive before that row.
+    // Respect both orders, rather than taking the row first and deadlocking.
+    acquire_channel_membership_lock(tx, community_id, channel_id).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))")
+        .bind(format!(
+            "buzz_channel_ttl:{}:{}",
+            community_id.as_uuid(),
+            channel_id
+        ))
+        .execute(&mut **tx)
+        .await?;
+    let channel = sqlx::query(
+        "SELECT channel_type::text AS channel_type, archived_at, ttl_deadline, max_members \
+         FROM channels WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL FOR SHARE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(channel_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(DbError::ChannelNotFound(channel_id))?;
+
+    let (_, inserted) =
+        crate::event::insert_event_in_transaction(tx, community_id, event, Some(channel_id))
+            .await?;
+    if !inserted {
+        return Ok(false);
+    }
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut **tx)
+        .await?;
+    let archived: Option<DateTime<Utc>> = channel.try_get("archived_at")?;
+    let deadline: Option<DateTime<Utc>> = channel.try_get("ttl_deadline")?;
+    let channel_type: String = channel.try_get("channel_type")?;
+    if archived.is_some()
+        || deadline.is_some_and(|d| d <= now)
+        || !matches!(channel_type.as_str(), "stream" | "forum")
+    {
+        return Err(DbError::AccessDenied(
+            "channel is not active for bot admission".into(),
+        ));
+    }
+    if precondition.expires_at <= now || event.created_at.as_secs() > now.timestamp() as u64 {
+        return Err(DbError::InvalidData(
+            "bot admission expired or not yet valid".into(),
+        ));
+    }
+    let actor = event.pubkey.to_bytes();
+    if get_active_role_tx(tx, community_id, channel_id, &actor)
+        .await?
+        .is_none()
+    {
+        return Err(DbError::AccessDenied(
+            "actor is not an active member".into(),
+        ));
+    }
+    if get_active_role_tx(tx, community_id, channel_id, &precondition.required_member)
+        .await?
+        .is_none()
+    {
+        return Err(DbError::InvalidData(
+            "required member is no longer active".into(),
+        ));
+    }
+    let current_role = get_active_role_tx(tx, community_id, channel_id, target).await?;
+    if current_role.as_deref() != precondition.expected_role.map(|role| role.as_str()) {
+        return Err(DbError::InvalidData("target membership changed".into()));
+    }
+    // The required member is a condition, not a substitute for the signed actor.
+    // Keep the existing target's add policy protected against concurrent edits.
+    let policy = sqlx::query(
+        "SELECT channel_add_policy::text AS policy, agent_owner_pubkey FROM users \
+         WHERE community_id = $1 AND pubkey = $2 FOR SHARE",
+    )
+    .bind(community_id.as_uuid())
+    .bind(target)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| DbError::AccessDenied("target identity is not registered".into()))?;
+    let owner: Option<Vec<u8>> = policy.try_get("agent_owner_pubkey")?;
+    let allowed = match policy.try_get::<String, _>("policy")?.as_str() {
+        "anyone" => true,
+        "owner_only" => owner.as_deref() == Some(actor.as_slice()),
+        _ => false,
+    };
+    if !allowed {
+        return Err(DbError::AccessDenied(
+            "target agent channel-add policy denied".into(),
+        ));
+    }
+    if current_role.is_none() {
+        if let Some(limit) = channel.try_get::<Option<i32>, _>("max_members")? {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM channel_members WHERE community_id = $1 AND channel_id = $2 AND removed_at IS NULL",
+            ).bind(community_id.as_uuid()).bind(channel_id).fetch_one(&mut **tx).await?;
+            if count >= i64::from(limit) {
+                return Err(DbError::AccessDenied("channel member limit reached".into()));
+            }
+        }
+    }
+    // The user-row policy lock and member count may have waited. Sample time
+    // again at the admission point so queued requests cannot outlive expiry/TTL.
+    let admission_now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut **tx)
+        .await?;
+    if precondition.expires_at <= admission_now || deadline.is_some_and(|d| d <= admission_now) {
+        return Err(DbError::InvalidData(
+            "bot admission or channel expired while waiting".into(),
+        ));
+    }
+    if current_role.is_none() {
+        sqlx::query(
+            "INSERT INTO channel_members (community_id, channel_id, pubkey, role, invited_by) \
+             VALUES ($1, $2, $3, 'bot', $4) \
+             ON CONFLICT (community_id, channel_id, pubkey) DO UPDATE SET \
+             removed_at = NULL, removed_by = NULL, role = EXCLUDED.role, invited_by = EXCLUDED.invited_by",
+        ).bind(community_id.as_uuid()).bind(channel_id).bind(target).bind(actor.as_slice())
+            .execute(&mut **tx).await?;
+    }
+    Ok(true)
+}
+
 /// Namespace for the per-channel membership advisory lock. Serializes the
 /// role-authorization + last-owner-count + write sequences in [`add_member`]
 /// and [`remove_member`] against each other.
