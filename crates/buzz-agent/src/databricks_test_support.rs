@@ -112,7 +112,9 @@ impl Server {
     pub fn builder(&self) -> ClientBuilder {
         let builder = Client::builder().no_proxy();
         match &self.cert {
-            Some(cert) => builder.add_root_certificate(cert.clone()),
+            // Local fixtures trust their generated certificate only. Consulting
+            // the OS trust store can stall the handshake past test deadlines.
+            Some(cert) => builder.tls_certs_only([cert.clone()]),
             None => builder,
         }
     }

@@ -3561,27 +3561,81 @@ mod tests {
 
     #[tokio::test]
     async fn keepalive_resets_idle_past_deadline() {
-        // Keepalive session/update lines every 50ms against a 100ms idle deadline.
-        // The turn should survive well past the 100ms deadline (proves the fix).
-        let mut client = spawn_script(
-            r#"for i in $(seq 1 20); do echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"keepalive"}}}'; sleep 0.05; done; sleep 10"#,
-        )
-        .await;
+        use tokio::io::AsyncWriteExt;
+
+        // Keep the real child-stdio/parser seam, but advance the production
+        // clock only after each frame is consumed, not on shell scheduling.
+        let mut client = spawn_script("exec cat").await;
+        let observer = ObserverHandle::in_process();
+        let mut events = observer.subscribe();
+        client.set_observer(Some(observer), 0);
+        let mut stdin = client.stdin.take().expect("echo adapter stdin");
+        tokio::time::pause();
         let max_dur = std::time::Duration::from_secs(10);
         let hard_deadline = tokio::time::Instant::now() + max_dur;
-        let start = std::time::Instant::now();
-        let result = client
-            .read_until_response_with_idle_timeout(
-                "test",
-                999,
-                std::time::Duration::from_millis(100),
-                hard_deadline,
-                max_dur,
-            )
-            .await;
-        let elapsed = start.elapsed();
-        // 20 keepalives × 50ms = ~1000ms of activity, then idle fires after 100ms more.
-        // Must survive well past the 100ms deadline.
+        let start = tokio::time::Instant::now();
+        let reading = tokio::spawn(async move {
+            let result = client
+                .read_until_response_with_idle_timeout(
+                    "test",
+                    999,
+                    std::time::Duration::from_millis(100),
+                    hard_deadline,
+                    max_dur,
+                )
+                .await;
+            (client, result, start.elapsed())
+        });
+        let fixture_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let frame = b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"update\":{\"sessionUpdate\":\"keepalive\"}}}\n";
+        let message: serde_json::Value = serde_json::from_slice(frame).expect("keepalive fixture");
+        for expected_seq in 1..=20 {
+            let mut write = std::pin::pin!(stdin.write_all(frame));
+            // Keep a runnable driver during OS I/O so paused Tokio time
+            // cannot auto-advance to the idle deadline before the echo.
+            loop {
+                assert!(
+                    std::time::Instant::now() < fixture_deadline,
+                    "echo adapter stalled"
+                );
+                match futures_util::poll!(&mut write) {
+                    std::task::Poll::Ready(result) => {
+                        result.expect("write keepalive to echo adapter");
+                        break;
+                    }
+                    std::task::Poll::Pending => tokio::task::yield_now().await,
+                }
+            }
+            loop {
+                assert!(
+                    std::time::Instant::now() < fixture_deadline,
+                    "echo adapter stalled"
+                );
+                match events.try_recv() {
+                    Ok(event) => {
+                        assert_eq!(event.kind, "acp_read");
+                        assert_eq!(event.seq, expected_seq);
+                        assert_eq!(event.payload, message);
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                        assert!(
+                            !reading.is_finished(),
+                            "reader stopped before consuming all keepalives"
+                        );
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("keepalive observer failed: {error}"),
+                }
+            }
+            tokio::time::advance(std::time::Duration::from_millis(50)).await;
+        }
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        let (mut client, result, elapsed) = reading.await.expect("join keepalive reader");
+        tokio::time::resume();
+        client.shutdown().await;
+        // Twenty keepalives span one second on the production clock, then
+        // silence must still produce the original bounded idle timeout.
         assert!(
             elapsed >= std::time::Duration::from_millis(500),
             "keepalive should reset idle past the deadline; elapsed only {elapsed:?}"

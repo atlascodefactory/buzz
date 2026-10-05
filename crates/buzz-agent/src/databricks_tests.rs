@@ -21,6 +21,51 @@ fn legacy(server: &Server, root: &Path, opener: Arc<Opener>) -> Arc<PkceOAuthTok
     .unwrap()
 }
 
+#[tokio::test]
+async fn fixture_tls_verifies_certificate_and_hostname() {
+    let trusted = Server::start(true, |_, _| Reply::Json(200, json!({}))).await;
+    let other = Server::start(true, |_, _| Reply::Json(200, json!({}))).await;
+    let client = trusted
+        .builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    assert!(client
+        .get(&trusted.base)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+    assert!(client
+        .get(&other.base)
+        .send()
+        .await
+        .unwrap_err()
+        .is_connect());
+    assert!(client
+        .get(trusted.base.replace("localhost", "127.0.0.1"))
+        .send()
+        .await
+        .unwrap_err()
+        .is_connect());
+    assert_eq!(trusted.count("/"), 1);
+    assert_eq!(other.count("/"), 0);
+    // The rejected server is reachable when its own certificate is trusted.
+    assert!(other
+        .builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap()
+        .get(&other.base)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+    assert_eq!(other.count("/"), 1);
+}
+
 #[test]
 fn public_constructor_requires_explicit_https_origin_and_root() {
     let root = tempfile::tempdir().unwrap();
