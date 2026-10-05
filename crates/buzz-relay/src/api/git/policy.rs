@@ -527,6 +527,24 @@ pub async fn hook_policy_check(
         _ => return (StatusCode::FORBIDDEN, "invalid pusher pubkey").into_response(),
     };
     let is_repo_owner = req.pusher_pubkey == repo_owner_hex;
+    // Direct repository ownership must not bypass a revoked assignment or
+    // the assigned human's current channel membership.
+    match buzz_db::assigned_bot::access_status(
+        state.db.pool(),
+        community,
+        &pusher_bytes,
+        channel_id,
+    )
+    .await
+    {
+        Ok(Some(false)) => {
+            return (StatusCode::FORBIDDEN, "assigned agent access withdrawn").into_response();
+        }
+        Err(_) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, "authorization unavailable").into_response();
+        }
+        _ => {}
+    }
     let is_managed_agent_owner = if is_repo_owner {
         false
     } else {

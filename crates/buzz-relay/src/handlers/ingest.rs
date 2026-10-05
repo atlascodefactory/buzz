@@ -74,6 +74,18 @@ fn map_huddle_backing_channel_error(error: buzz_db::DbError) -> IngestError {
     }
 }
 
+pub(super) fn map_event_persistence_error(error: buzz_db::DbError) -> IngestError {
+    match error {
+        buzz_db::DbError::Sqlx(sqlx::Error::Database(ref db))
+            if db.code().as_deref() == Some("42501")
+                && db.constraint() == Some("assigned_bot_event_write") =>
+        {
+            IngestError::Rejected("restricted: assigned agent write withdrawn".into())
+        }
+        error => IngestError::Internal(format!("error: {error}")),
+    }
+}
+
 fn expected_huddle_backing_ttl(ephemeral_ttl_override: Option<i32>) -> i32 {
     ephemeral_ttl_override.unwrap_or(3600)
 }
@@ -545,7 +557,9 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_FORUM_VOTE
         | KIND_FORUM_COMMENT => Ok(Scope::MessagesWrite),
         KIND_NIP29_PUT_USER | KIND_NIP29_REMOVE_USER | KIND_NIP29_DELETE_GROUP
-        | buzz_core::kind::KIND_CONDITIONAL_BOT_ADMISSION => {
+        | buzz_core::kind::KIND_CONDITIONAL_BOT_ADMISSION
+        | buzz_core::kind::KIND_ASSIGNED_BOT_ADMISSION
+        | buzz_core::kind::KIND_ASSIGNED_BOT_REVOCATION => {
             Ok(Scope::AdminChannels)
         }
         // NIP-43: relay membership admin commands (9030–9032) + Buzz
@@ -813,6 +827,18 @@ pub(crate) async fn check_channel_membership(
     pubkey_bytes: &[u8],
     channel: Option<&buzz_db::channel::ChannelRecord>,
 ) -> Result<(), String> {
+    if buzz_db::assigned_bot::access_status(
+        state.db.pool(),
+        tenant.community(),
+        pubkey_bytes,
+        Some(ch_id),
+    )
+    .await
+    .map_err(|_| "error: assigned access unavailable".to_string())?
+        == Some(false)
+    {
+        return Err("restricted: assigned agent channel access withdrawn".into());
+    }
     match state
         .is_member_cached(tenant.community(), ch_id, pubkey_bytes)
         .await
@@ -1301,6 +1327,20 @@ async fn validate_edit_ownership(
 
     let author = effective_message_author(&target_event.event, &state.relay_keypair.public_key());
     let actor = event.pubkey.to_bytes().to_vec();
+    if let Some(channel) = target_event.channel_id {
+        if buzz_db::assigned_bot::access_status(
+            state.db.pool(),
+            community_id,
+            &actor,
+            Some(channel),
+        )
+        .await
+        .map_err(|error| format!("assignment access: {error}"))?
+            == Some(false)
+        {
+            return Err("restricted: assigned agent channel access withdrawn".into());
+        }
+    }
     if author == actor {
         // Author editing their own message: re-gate on membership/open visibility so that
         // a removed private-channel member cannot mutate old messages after access is revoked.
@@ -2251,6 +2291,20 @@ pub(crate) async fn enforce_write_restriction(
     kind: u32,
     pubkey: &nostr::PublicKey,
 ) -> Result<(), IngestError> {
+    if buzz_db::assigned_bot::access_status(
+        state.db.pool(),
+        tenant.community(),
+        pubkey.as_bytes(),
+        None,
+    )
+    .await
+    .map_err(|_| IngestError::Internal("error: assigned access unavailable".into()))?
+        == Some(false)
+    {
+        return Err(IngestError::AuthFailed(
+            "restricted: assigned agent access withdrawn".into(),
+        ));
+    }
     let restriction = state
         .db
         .moderation_restriction_state(tenant.community(), pubkey.as_bytes())
@@ -2512,6 +2566,49 @@ async fn ingest_event_inner(
     // (commands, feedback, reports, moderation) so no write returns ahead of it.
     enforce_write_restriction(state, tenant, kind_u32, auth.pubkey()).await?;
 
+    // This is a separate pinned policy, not a relaxation of 9000/9010 or of
+    // the normal channel-member gate. The DB checks the assigned owner's current
+    // membership under the same writer lock that serializes removal.
+    if matches!(
+        kind_u32,
+        buzz_core::kind::KIND_ASSIGNED_BOT_ADMISSION
+            | buzz_core::kind::KIND_ASSIGNED_BOT_REVOCATION
+    ) {
+        let claimed = claimed_community_from_event(&event);
+        let msg_id = msg_id_label(event.id.as_bytes());
+        let (result, channel) =
+            super::assigned_bot::accept(tenant, state, event, *auth.pubkey(), auth.channel_ids())
+                .await?;
+        if let Some(channel) = channel {
+            let action = if result.message == "duplicate:" {
+                TraceAction::WriteDuplicate {
+                    msg_id,
+                    channel: channel_label(channel),
+                    claimed_community: claimed,
+                }
+            } else {
+                TraceAction::WriteInsert {
+                    msg_id,
+                    channel: channel_label(channel),
+                    claimed_community: claimed,
+                }
+            };
+            emit(tracer, action, state_for_request(tenant, auth.pubkey()));
+            super::conditional_membership::publish_current_roster(tenant, state, channel).await?;
+        } else {
+            // As for other global events, replay is idempotent in the trace model.
+            emit(
+                tracer,
+                TraceAction::WriteInsertGlobal {
+                    msg_id,
+                    claimed_community: claimed,
+                },
+                state_for_request(tenant, auth.pubkey()),
+            );
+        }
+        return Ok(result);
+    }
+
     // Command kinds are routed AFTER signature verification, timestamp check,
     // pubkey/auth match, and scope validation — never before.
     if buzz_core::kind::is_command_kind(kind_u32) {
@@ -2689,6 +2786,24 @@ async fn ingest_event_inner(
         _ => None,
     };
     if let Some(ch_id) = channel_id {
+        // Legacy own-edit/admin exceptions never bypass an assigned agent's
+        // current owner/channel boundary. Only a genuinely new channel has no
+        // membership to check yet; its creation still passes the global gate.
+        if (kind_u32 != KIND_NIP29_CREATE_GROUP || channel_row.is_some())
+            && buzz_db::assigned_bot::access_status(
+                state.db.pool(),
+                tenant.community(),
+                &pubkey_bytes,
+                Some(ch_id),
+            )
+            .await
+            .map_err(|error| IngestError::Internal(format!("assignment access: {error}")))?
+                == Some(false)
+        {
+            return Err(IngestError::Rejected(
+                "restricted: assigned agent channel access withdrawn".into(),
+            ));
+        }
         // kind:9021 (join) doesn't require prior membership.
         // kind:9007 (create) — channel doesn't exist yet; creator becomes owner in step 16.
         // kind:40003/9002/9005/9008 — per-kind validators are the authority; they
@@ -3309,7 +3424,7 @@ async fn ingest_event_inner(
                 emoji,
             )
             .await
-            .map_err(|e| IngestError::Internal(format!("error: {e}")))?
+            .map_err(map_event_persistence_error)?
         {
             buzz_db::ReactionEventInsertOutcome::TargetMissing => {
                 return Err(IngestError::Rejected(
@@ -3397,7 +3512,7 @@ async fn ingest_event_inner(
             .db
             .replace_addressable_event(tenant.community(), &event, channel_id)
             .await
-            .map_err(|e| IngestError::Internal(format!("error: {e}")))?
+            .map_err(map_event_persistence_error)?
     } else if is_parameterized_replaceable(kind_u32) {
         // NIP-33 parameterized replaceable — keyed by (kind, pubkey, d_tag).
         let d_tag = buzz_db::event::extract_d_tag(&event).unwrap_or_default();
@@ -3412,7 +3527,7 @@ async fn ingest_event_inner(
             .db
             .replace_parameterized_event(tenant.community(), &event, &d_tag, channel_id)
             .await
-            .map_err(|e| IngestError::Internal(format!("error: {e}")))?
+            .map_err(map_event_persistence_error)?
     } else if let Some(spec) = canvas_revision_spec.as_ref() {
         // Canvas write carrying an optimistic-concurrency precondition. Plain
         // canvas writes (no `expected-revision` tag) fall through to the generic
@@ -3429,7 +3544,7 @@ async fn ingest_event_inner(
             .db
             .insert_channel_head_checked(tenant.community(), &event, channel, precondition)
             .await
-            .map_err(|e| IngestError::Internal(format!("error: {e}")))?;
+            .map_err(map_event_persistence_error)?;
         match status {
             buzz_db::ChannelHeadWriteStatus::RevisionMissing => {
                 return Err(IngestError::CanvasConflict(
@@ -3479,7 +3594,7 @@ async fn ingest_event_inner(
                     buzz_db::DbError::AuthEventRejected => {
                         IngestError::Rejected("invalid: AUTH events cannot be stored".into())
                     }
-                    other => IngestError::Internal(format!("error: database error: {other}")),
+                    other => map_event_persistence_error(other),
                 });
             }
         }

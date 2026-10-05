@@ -277,6 +277,21 @@ async fn authorize_management(
                         .any(|value| nostr::PublicKey::parse(value).ok().as_ref() == Some(key))
             })
     };
+    if buzz_db::assigned_bot::access_status(
+        state.db.pool(),
+        community,
+        auth.caller.as_bytes(),
+        Some(channel),
+    )
+    .await
+    .map_err(backend)?
+        == Some(false)
+    {
+        return Err(error(
+            StatusCode::FORBIDDEN,
+            "assigned agent channel access withdrawn",
+        ));
+    }
     // Direct authority is independent of an optional owner credential.
     if named_manager(&auth.caller)
         || state

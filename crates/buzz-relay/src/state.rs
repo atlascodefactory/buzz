@@ -1626,6 +1626,18 @@ impl AppState {
         channel_id: Uuid,
         pubkey: &[u8],
     ) -> Result<bool, buzz_db::DbError> {
+        // Assigned agents never trust a cached positive after owner departure
+        // or revocation. Legacy keys retain the established cache behavior.
+        if let Some(allowed) = buzz_db::assigned_bot::access_status(
+            self.db.pool(),
+            community_id,
+            pubkey,
+            Some(channel_id),
+        )
+        .await?
+        {
+            return Ok(allowed);
+        }
         let key = (community_id, channel_id, pubkey.to_vec());
         if let Some(cached) = self.membership_cache.get(&key) {
             metrics::counter!("buzz_membership_cache_hits_total").increment(1);
@@ -1995,6 +2007,17 @@ impl AppState {
         community_id: CommunityId,
         pubkey: &[u8],
     ) -> Result<Vec<Uuid>, buzz_db::DbError> {
+        if buzz_db::assigned_bot::access_status(self.db.pool(), community_id, pubkey, None)
+            .await?
+            .is_some()
+        {
+            // The writer query applies the assignment gate before returning
+            // channels, including open ones. No cached positive can bypass it.
+            return self
+                .db
+                .get_accessible_channel_ids(community_id, pubkey)
+                .await;
+        }
         let key = (community_id, pubkey.to_vec());
         if let Some(cached) = self.accessible_channels_cache.get(&key) {
             metrics::counter!("buzz_accessible_channels_cache_hits_total").increment(1);

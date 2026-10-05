@@ -47,9 +47,11 @@ fn classify_relay_membership(
     use crate::api::relay_members::MembershipDecision;
 
     match result {
-        Ok(MembershipDecision::OpenRelay | MembershipDecision::Member) => {
-            PolicyCheck::Allowed(None)
-        }
+        Ok(
+            MembershipDecision::OpenRelay
+            | MembershipDecision::Member
+            | MembershipDecision::AssignedBot,
+        ) => PolicyCheck::Allowed(None),
         Ok(MembershipDecision::ViaOwner(owner)) => PolicyCheck::Allowed(Some(owner)),
         Ok(MembershipDecision::Denied) => PolicyCheck::Denied,
         Err(_) => PolicyCheck::DependencyError,
@@ -3161,9 +3163,9 @@ mod tests {
                 "Fix 4a: FI allowlist denial must cancel the connection token"
             );
         }
-        /// A pool whose `search_path` is a fresh schema holding only
-        /// `community_bans`: the ban gate succeeds, every later policy table
-        /// is missing, so the next lookup fails as a dependency error.
+        /// A pool whose `search_path` contains the ban and assignment gates,
+        /// but no allowlist or relay-membership table. Those later lookups
+        /// fail as dependency errors without an earlier unrelated refusal.
         async fn ban_only_schema_pool() -> (sqlx::PgPool, sqlx::PgPool, String) {
             use sqlx::postgres::PgConnectOptions;
             let db_url = crate::test_support::database_url();
@@ -3174,7 +3176,12 @@ mod tests {
             sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
                 "CREATE SCHEMA {schema}; \
                  CREATE TABLE {schema}.community_bans (LIKE public.community_bans INCLUDING ALL); \
-                 CREATE TABLE {schema}.users (LIKE public.users INCLUDING ALL);"
+                 CREATE TABLE {schema}.users (LIKE public.users INCLUDING ALL); \
+                 CREATE TABLE {schema}.assigned_bots (LIKE public.assigned_bots INCLUDING ALL); \
+                 CREATE FUNCTION {schema}.assigned_bot_access_allowed(target UUID, actor BYTEA, channel UUID) \
+                 RETURNS BOOLEAN LANGUAGE sql STABLE AS $$ \
+                   SELECT public.assigned_bot_access_allowed(target, actor, channel) \
+                 $$;"
             )))
             .execute(&admin)
             .await
@@ -3370,6 +3377,10 @@ mod tests {
         );
         assert_eq!(
             classify_relay_membership(Ok(MembershipDecision::Member)),
+            PolicyCheck::Allowed(None)
+        );
+        assert_eq!(
+            classify_relay_membership(Ok(MembershipDecision::AssignedBot)),
             PolicyCheck::Allowed(None)
         );
         assert_eq!(

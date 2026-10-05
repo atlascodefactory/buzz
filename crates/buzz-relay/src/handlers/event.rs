@@ -200,51 +200,66 @@ pub async fn filter_fanout_by_access(
         matches
     };
 
-    let Some(channel_id) = stored_event.channel_id else {
-        return matches;
-    };
-    // Fence 3 (§4.8 phase-2): the threaded value is used only when it was
-    // resolved under exactly this (community_id, channel_id); anything else
-    // falls through to the fresh lookup. Fence 1: absence of a usable threaded
-    // value is never "open" — it is the same fail-closed path as before.
-    let visibility = match threaded {
-        Some(t) if t.community_id == community_id && t.channel_id == channel_id => {
-            Ok(t.visibility.clone())
-        }
-        _ => {
-            state
-                .channel_visibility_cached(community_id, channel_id, None)
-                .await
-        }
-    };
-    match visibility {
-        Ok(v) if v != "private" => return matches,
-        Ok(_) => {}
-        Err(e) => {
-            // Fail closed: if we cannot determine visibility, do not leak a
-            // possibly-private channel's events.
-            warn!(%channel_id, "fan-out access filter: visibility lookup failed: {e}");
-            return Vec::new();
-        }
-    }
-
-    let mut allowed = Vec::with_capacity(matches.len());
-    for (conn_id, sub_id) in matches {
-        let Some(pubkey) = state.conn_manager.pubkey_for_conn(conn_id) else {
-            continue;
+    // Resolve private visibility before the batch, so one writer statement
+    // handles both ordinary membership and assigned-agent withdrawal.
+    let require_membership = if let Some(channel_id) = stored_event.channel_id {
+        let visibility = match threaded {
+            Some(t) if t.community_id == community_id && t.channel_id == channel_id => {
+                Ok(t.visibility.clone())
+            }
+            _ => {
+                state
+                    .channel_visibility_cached(community_id, channel_id, None)
+                    .await
+            }
         };
-        match state
-            .is_member_cached(community_id, channel_id, &pubkey)
-            .await
-        {
-            Ok(true) => allowed.push((conn_id, sub_id)),
-            Ok(false) => {}
-            Err(e) => {
-                warn!(%channel_id, "fan-out access filter: membership lookup failed: {e}");
+        match visibility {
+            Ok(v) => v == "private",
+            Err(error) => {
+                warn!(%channel_id, %error, "fan-out visibility unavailable; delivery denied");
+                return Vec::new();
             }
         }
-    }
-    allowed
+    } else {
+        false
+    };
+    // Recheck assigned recipients even for global/open events. Distinct keys
+    // and one writer query avoid serial per-subscription authorization reads.
+    let principals: Vec<Vec<u8>> = matches
+        .iter()
+        .filter_map(|(id, _)| {
+            state
+                .conn_manager
+                .pubkey_for_conn(*id)
+                .map(|pk| pk.to_vec())
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let allowed = match buzz_db::assigned_bot::filter_recipients(
+        state.db.pool(),
+        community_id,
+        &principals,
+        stored_event.channel_id,
+        require_membership,
+    )
+    .await
+    {
+        Ok(keys) => keys.into_iter().collect::<std::collections::HashSet<_>>(),
+        Err(error) => {
+            warn!(%error, "fan-out assigned access unavailable; delivery denied");
+            return Vec::new();
+        }
+    };
+    matches
+        .into_iter()
+        .filter(|(id, _)| {
+            state
+                .conn_manager
+                .pubkey_for_conn(*id)
+                .map_or(!require_membership, |pk| allowed.contains(pk.as_slice()))
+        })
+        .collect()
 }
 
 /// Deliver one event to this relay's local subscribers through the access gate.
@@ -2036,8 +2051,7 @@ mod tests {
         /// Owner-only kinds arriving over Redis reach only the `p`-tagged owner,
         /// even through a kindless `ids:[…]` subscription on a foreign
         /// connection, and fail closed when no owner is tagged.
-        #[tokio::test]
-        async fn pubsub_owner_only_kinds_reach_only_the_owner() {
+        async fn pubsub_owner_only_kinds_reach_only_the_owner_body() {
             for kind in [
                 buzz_core::kind::KIND_DM_VISIBILITY,
                 buzz_core::kind::KIND_AGENT_TURN_METRIC,
@@ -2093,8 +2107,7 @@ mod tests {
         /// Same-pod dispatch applies the owner-only gate: owner-only kinds
         /// published on this pod reach only the `p`-tagged owner, never a
         /// foreign kindless `ids:[…]` subscription, and no one when untagged.
-        #[tokio::test]
-        async fn dispatch_owner_only_kinds_reach_only_the_owner() {
+        async fn dispatch_owner_only_kinds_reach_only_the_owner_body() {
             for kind in [
                 buzz_core::kind::KIND_DM_VISIBILITY,
                 buzz_core::kind::KIND_AGENT_TURN_METRIC,
@@ -2242,8 +2255,7 @@ mod tests {
             assert_eq!(delivered.id, event_id);
         }
 
-        #[tokio::test]
-        async fn global_membership_pubsub_event_fans_out_by_p_tag() {
+        async fn global_membership_pubsub_event_fans_out_by_p_tag_body() {
             let state = test_state().await;
             let target = Keys::generate();
             let other = Keys::generate();
@@ -2274,6 +2286,24 @@ mod tests {
                 other_rx.try_recv().is_err(),
                 "membership notification should only reach matching #p subscribers"
             );
+        }
+
+        mod postgres_tests {
+            #[tokio::test]
+            #[ignore = "requires Postgres"]
+            async fn pubsub_owner_only_kinds_reach_only_the_owner() {
+                super::pubsub_owner_only_kinds_reach_only_the_owner_body().await;
+            }
+            #[tokio::test]
+            #[ignore = "requires Postgres"]
+            async fn dispatch_owner_only_kinds_reach_only_the_owner() {
+                super::dispatch_owner_only_kinds_reach_only_the_owner_body().await;
+            }
+            #[tokio::test]
+            #[ignore = "requires Postgres"]
+            async fn global_membership_pubsub_event_fans_out_by_p_tag() {
+                super::global_membership_pubsub_event_fans_out_by_p_tag_body().await;
+            }
         }
 
         async fn redis_url_if_available() -> Option<String> {
@@ -2718,6 +2748,18 @@ mod tests {
         }
 
         fn register_conn(state: &AppState, pubkey: Option<Vec<u8>>) -> Uuid {
+            register_conn_scoped(
+                state,
+                pubkey,
+                buzz_core::CommunityId::from_uuid(Uuid::nil()),
+            )
+        }
+
+        fn register_conn_scoped(
+            state: &AppState,
+            pubkey: Option<Vec<u8>>,
+            community: buzz_core::CommunityId,
+        ) -> Uuid {
             let conn_id = Uuid::new_v4();
             let (tx, _rx) = mpsc::channel(1);
             let (ctrl_tx, _ctrl_rx) = mpsc::channel(1);
@@ -2728,7 +2770,7 @@ mod tests {
                 tokio::sync::mpsc::channel(1).0,
                 None,
                 CancellationToken::new(),
-                buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                community,
                 Arc::new(AtomicU8::new(0)),
                 Arc::new(Mutex::new(HashMap::new())),
                 3,
@@ -2749,8 +2791,7 @@ mod tests {
             StoredEvent::new(event, channel_id)
         }
 
-        #[tokio::test]
-        async fn channel_less_event_passes_through() {
+        async fn channel_less_event_passes_through_body() {
             let state = test_state().await;
             let conn = register_conn(&state, Some(vec![1u8; 32]));
             let matches = vec![(conn, "s".to_string())];
@@ -2767,8 +2808,7 @@ mod tests {
 
         /// The shared gate used by same-pod dispatch and Redis delivery keeps
         /// only the `p`-tagged owner for owner-only kinds.
-        #[tokio::test]
-        async fn owner_only_kinds_keep_only_the_owner() {
+        async fn owner_only_kinds_keep_only_the_owner_body() {
             let state = test_state().await;
             let community_id = buzz_core::tenant::CommunityId::from_uuid(Uuid::nil());
             let owner = Keys::generate();
@@ -2823,16 +2863,14 @@ mod tests {
             assert_eq!(out, matches);
         }
 
-        #[tokio::test]
-        async fn private_channel_keeps_member_drops_non_member_and_unknown() {
+        async fn private_channel_keeps_member_drops_non_member_and_unknown_body() {
             let state = test_state().await;
-            let channel_id = Uuid::new_v4();
-            let community_id = buzz_core::tenant::CommunityId::from_uuid(Uuid::nil());
+            let member_pk = vec![1u8; 32];
+            let (community_id, channel_id) = private_legacy_channel(&state, &member_pk).await;
             state
                 .channel_visibility_cache
                 .insert((community_id, channel_id), "private".to_string());
 
-            let member_pk = vec![1u8; 32];
             let non_member_pk = vec![2u8; 32];
             state
                 .membership_cache
@@ -2841,9 +2879,9 @@ mod tests {
                 .membership_cache
                 .insert((community_id, channel_id, non_member_pk.clone()), false);
 
-            let member = register_conn(&state, Some(member_pk));
-            let non_member = register_conn(&state, Some(non_member_pk));
-            let unauthed = register_conn(&state, None);
+            let member = register_conn_scoped(&state, Some(member_pk), community_id);
+            let non_member = register_conn_scoped(&state, Some(non_member_pk), community_id);
+            let unauthed = register_conn_scoped(&state, None, community_id);
 
             let matches = vec![
                 (member, "m".to_string()),
@@ -2861,8 +2899,7 @@ mod tests {
             assert_eq!(out, vec![(member, "m".to_string())]);
         }
 
-        #[tokio::test]
-        async fn author_only_reminder_delivers_to_author_only() {
+        async fn author_only_reminder_delivers_to_author_only_body() {
             let state = test_state().await;
 
             let author_keys = Keys::generate();
@@ -2943,15 +2980,12 @@ mod tests {
             );
         }
 
-        /// Matching threaded `private` gates recipients without a DB read,
-        /// identically to the fresh-lookup private path.
-        #[tokio::test]
-        async fn threaded_visibility_private_filters_members_only() {
+        /// Matching threaded `private` skips the visibility read, not the
+        /// fresh membership/assignment authorization batch.
+        async fn threaded_visibility_private_filters_members_only_body() {
             let state = test_state().await;
-            let channel_id = Uuid::new_v4();
-            let community_id = buzz_core::tenant::CommunityId::from_uuid(Uuid::nil());
-
             let member_pk = vec![1u8; 32];
+            let (community_id, channel_id) = private_legacy_channel(&state, &member_pk).await;
             let non_member_pk = vec![2u8; 32];
             state
                 .membership_cache
@@ -2966,8 +3000,8 @@ mod tests {
                 visibility: "private".to_string(),
             };
 
-            let member = register_conn(&state, Some(member_pk));
-            let non_member = register_conn(&state, Some(non_member_pk));
+            let member = register_conn_scoped(&state, Some(member_pk), community_id);
+            let non_member = register_conn_scoped(&state, Some(non_member_pk), community_id);
             let matches = vec![(member, "m".to_string()), (non_member, "n".to_string())];
             let out = filter_fanout_by_access(
                 &state,
@@ -2978,6 +3012,123 @@ mod tests {
             )
             .await;
             assert_eq!(out, vec![(member, "m".to_string())]);
+        }
+
+        async fn private_legacy_channel(
+            state: &AppState,
+            member: &[u8],
+        ) -> (buzz_core::CommunityId, Uuid) {
+            let community = state
+                .db
+                .ensure_configured_community(&format!(
+                    "legacy-fanout-{}.test",
+                    Uuid::new_v4().simple()
+                ))
+                .await
+                .expect("isolated legacy community")
+                .id;
+            state
+                .db
+                .ensure_user(community, member)
+                .await
+                .expect("legacy member");
+            let channel = state
+                .db
+                .create_channel(
+                    community,
+                    "legacy-private",
+                    buzz_db::channel::ChannelType::Stream,
+                    buzz_db::channel::ChannelVisibility::Private,
+                    None,
+                    member,
+                    None,
+                )
+                .await
+                .expect("legacy channel")
+                .id;
+            (community, channel)
+        }
+
+        mod postgres_tests {
+            #[tokio::test]
+            #[ignore = "requires Postgres"]
+            async fn channel_less_event_passes_through() {
+                super::channel_less_event_passes_through_body().await;
+            }
+            #[tokio::test]
+            #[ignore = "requires Postgres"]
+            async fn deleted_private_channel_denies_legacy_recipient_despite_threaded_visibility() {
+                use super::*;
+                let state = test_state().await;
+                let member = Keys::generate().public_key().to_bytes().to_vec();
+                let (community, channel) = private_legacy_channel(&state, &member).await;
+                let conn = register_conn_scoped(&state, Some(member.clone()), community);
+                let threaded = crate::state::ThreadedChannelVisibility {
+                    community_id: community,
+                    channel_id: channel,
+                    visibility: "private".into(),
+                };
+                let matches = vec![
+                    (conn, "legacy".into()),
+                    (conn, "second subscription".into()),
+                ];
+                let stored = channel_event(Some(channel));
+                assert_eq!(
+                    filter_fanout_by_access(
+                        &state,
+                        community,
+                        &stored,
+                        matches.clone(),
+                        Some(&threaded)
+                    )
+                    .await,
+                    matches
+                );
+                assert!(state
+                    .db
+                    .soft_delete_channel(community, channel)
+                    .await
+                    .unwrap());
+                assert!(buzz_db::assigned_bot::filter_recipients(
+                    state.db.pool(),
+                    community,
+                    &[member.clone(), member],
+                    Some(channel),
+                    true
+                )
+                .await
+                .unwrap()
+                .is_empty());
+                assert!(filter_fanout_by_access(
+                    &state,
+                    community,
+                    &stored,
+                    matches,
+                    Some(&threaded)
+                )
+                .await
+                .is_empty());
+            }
+            #[tokio::test]
+            #[ignore = "requires Postgres"]
+            async fn owner_only_kinds_keep_only_the_owner() {
+                super::owner_only_kinds_keep_only_the_owner_body().await;
+            }
+            #[tokio::test]
+            #[ignore = "requires Postgres"]
+            async fn private_channel_keeps_member_drops_non_member_and_unknown() {
+                super::private_channel_keeps_member_drops_non_member_and_unknown_body().await;
+            }
+            #[tokio::test]
+            #[ignore = "requires Postgres"]
+            async fn author_only_reminder_delivers_to_author_only() {
+                super::author_only_reminder_delivers_to_author_only_body().await;
+            }
+            #[tokio::test]
+            #[ignore = "requires Postgres"]
+            async fn threaded_visibility_private_filters_members_only() {
+                super::threaded_visibility_private_filters_members_only_body().await;
+            }
         }
 
         /// Matching threaded `open` passes recipients through with no

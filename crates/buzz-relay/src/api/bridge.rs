@@ -43,7 +43,25 @@ pub(crate) async fn enforce_http_admission(
     )
     .await
     {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if buzz_db::assigned_bot::access_status(
+                state.db.pool(),
+                tenant.community(),
+                pubkey.as_bytes(),
+                None,
+            )
+            .await
+            .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "authorization unavailable"))?
+                == Some(false)
+            {
+                Err(api_error(
+                    StatusCode::FORBIDDEN,
+                    "assigned agent access withdrawn",
+                ))
+            } else {
+                Ok(())
+            }
+        }
         Err(crate::admission::AdmissionError::Exceeded { reset_in_secs }) => {
             metrics::counter!("buzz_admission_rejections_total", "transport" => "http", "reason" => "quota", "bucket" => "api_calls").increment(1);
             Err(api_error(
@@ -8139,7 +8157,12 @@ mod postgres_tests {
                 "CREATE SCHEMA {schema}; \
                  CREATE TABLE {schema}.users (LIKE public.users INCLUDING ALL); \
                  CREATE TABLE {schema}.community_bans (LIKE public.community_bans INCLUDING ALL); \
-                 CREATE TABLE {schema}.relay_members (LIKE public.relay_members INCLUDING ALL);"
+                 CREATE TABLE {schema}.relay_members (LIKE public.relay_members INCLUDING ALL); \
+                 CREATE TABLE {schema}.assigned_bots (LIKE public.assigned_bots INCLUDING ALL); \
+                 CREATE FUNCTION {schema}.assigned_bot_access_allowed(target UUID, actor BYTEA, channel UUID) \
+                 RETURNS BOOLEAN LANGUAGE sql STABLE AS $$ \
+                   SELECT public.assigned_bot_access_allowed(target, actor, channel) \
+                 $$;"
             )))
             .execute(state.db.pool())
             .await

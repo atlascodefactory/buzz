@@ -59,6 +59,65 @@ pub async fn admit_bot_conditionally_in_transaction(
     target: &[u8],
     precondition: &MemberAdmissionPrecondition,
 ) -> Result<bool> {
+    admit_bot_in_transaction(
+        tx,
+        community_id,
+        event,
+        channel_id,
+        target,
+        precondition,
+        None,
+    )
+    .await
+}
+
+/// The assignment caller holds the bot lifecycle lock before membership locks.
+pub(crate) async fn admit_assigned_bot_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    command: &buzz_core::assigned_bot::AssignedBotCommand,
+) -> Result<bool> {
+    use buzz_core::assigned_bot::{AssignedBotOperation, ExpectedBotRole};
+    let AssignedBotOperation::Admit {
+        channel_id,
+        expected_role,
+    } = command.operation()
+    else {
+        return Err(DbError::InvalidData("not an assigned admission".into()));
+    };
+    let expires_at = i64::try_from(command.expires_at())
+        .ok()
+        .and_then(|s| DateTime::from_timestamp(s, 0))
+        .ok_or_else(|| DbError::InvalidData("invalid assignment expiry".into()))?;
+    let precondition = MemberAdmissionPrecondition {
+        required_member: command.owner().to_bytes().to_vec(),
+        expected_role: match expected_role {
+            ExpectedBotRole::Absent => None,
+            ExpectedBotRole::Bot => Some(MemberRole::Bot),
+        },
+        expires_at,
+    };
+    admit_bot_in_transaction(
+        tx,
+        command.community(),
+        command.event(),
+        channel_id,
+        &command.bot().to_bytes(),
+        &precondition,
+        Some(command),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn admit_bot_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    event: &nostr::Event,
+    channel_id: Uuid,
+    target: &[u8],
+    precondition: &MemberAdmissionPrecondition,
+    assignment: Option<&buzz_core::assigned_bot::AssignedBotCommand>,
+) -> Result<bool> {
     if target.len() != 32
         || precondition.required_member.len() != 32
         || !matches!(precondition.expected_role, None | Some(MemberRole::Bot))
@@ -115,9 +174,10 @@ pub async fn admit_bot_conditionally_in_transaction(
         ));
     }
     let actor = event.pubkey.to_bytes();
-    if get_active_role_tx(tx, community_id, channel_id, &actor)
-        .await?
-        .is_none()
+    if assignment.is_none()
+        && get_active_role_tx(tx, community_id, channel_id, &actor)
+            .await?
+            .is_none()
     {
         return Err(DbError::AccessDenied(
             "actor is not an active member".into(),
@@ -135,10 +195,38 @@ pub async fn admit_bot_conditionally_in_transaction(
     if current_role.as_deref() != precondition.expected_role.map(|role| role.as_str()) {
         return Err(DbError::InvalidData("target membership changed".into()));
     }
+    if let Some(command) = assignment {
+        // The pinned assignment authority may bootstrap ONLY its own bot.
+        // Lock the current owner's membership through this admission commit;
+        // never manufacture a NIP-OA owner or a permanent relay-member grant.
+        let owner = sqlx::query(
+            "SELECT u.pubkey FROM users u JOIN relay_members r \
+             ON r.community_id = u.community_id AND r.pubkey = encode(u.pubkey, 'hex') \
+             WHERE u.community_id = $1 AND u.pubkey = $2 AND u.deactivated_at IS NULL \
+             FOR SHARE OF u, r",
+        )
+        .bind(community_id.as_uuid())
+        .bind(command.owner().to_bytes().as_slice())
+        .fetch_optional(&mut **tx)
+        .await?;
+        if owner.is_none() {
+            return Err(DbError::AccessDenied(
+                "assigned owner is not an active relay member".into(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO users (community_id, pubkey, agent_type, channel_add_policy) \
+             VALUES ($1, $2, 'atlas-assigned', 'owner_only') ON CONFLICT DO NOTHING",
+        )
+        .bind(community_id.as_uuid())
+        .bind(target)
+        .execute(&mut **tx)
+        .await?;
+    }
     // The required member is a condition, not a substitute for the signed actor.
     // Keep the existing target's add policy protected against concurrent edits.
     let policy = sqlx::query(
-        "SELECT channel_add_policy::text AS policy, agent_owner_pubkey FROM users \
+        "SELECT channel_add_policy::text AS policy, agent_owner_pubkey, deactivated_at FROM users \
          WHERE community_id = $1 AND pubkey = $2 FOR SHARE",
     )
     .bind(community_id.as_uuid())
@@ -147,14 +235,53 @@ pub async fn admit_bot_conditionally_in_transaction(
     .await?
     .ok_or_else(|| DbError::AccessDenied("target identity is not registered".into()))?;
     let owner: Option<Vec<u8>> = policy.try_get("agent_owner_pubkey")?;
+    if let Some(command) = assignment {
+        let owner_state: Option<Option<DateTime<Utc>>> = sqlx::query_scalar(
+            "SELECT deactivated_at FROM users WHERE community_id = $1 AND pubkey = $2 FOR SHARE",
+        )
+        .bind(community_id.as_uuid())
+        .bind(command.owner().to_bytes().as_slice())
+        .fetch_optional(&mut **tx)
+        .await?;
+        if !matches!(owner_state, Some(None))
+            || policy
+                .try_get::<Option<DateTime<Utc>>, _>("deactivated_at")?
+                .is_some()
+            || owner
+                .as_deref()
+                .is_some_and(|oa_owner| oa_owner != command.owner().to_bytes().as_slice())
+        {
+            return Err(DbError::AccessDenied(
+                "assigned identities are inactive or ownership conflicts".into(),
+            ));
+        }
+    }
     let allowed = match policy.try_get::<String, _>("policy")?.as_str() {
         "anyone" => true,
-        "owner_only" => owner.as_deref() == Some(actor.as_slice()),
+        // A verified assignment is a separate, pinned administrative policy.
+        // It does not write NIP-OA ownership or authorize any legacy signer.
+        "owner_only" => assignment.is_some() || owner.as_deref() == Some(actor.as_slice()),
         _ => false,
     };
     if !allowed {
         return Err(DbError::AccessDenied(
             "target agent channel-add policy denied".into(),
+        ));
+    }
+    if assignment.is_some()
+        && sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM community_bans \
+             WHERE community_id = $1 AND pubkey IN ($2, $3) AND banned \
+             AND (ban_expires_at IS NULL OR ban_expires_at > clock_timestamp()))",
+        )
+        .bind(community_id.as_uuid())
+        .bind(target)
+        .bind(precondition.required_member.as_slice())
+        .fetch_one(&mut **tx)
+        .await?
+    {
+        return Err(DbError::AccessDenied(
+            "assigned identity authority is withdrawn".into(),
         ));
     }
     if current_role.is_none() {
@@ -382,7 +509,8 @@ pub async fn is_member_in_transaction(
     let row = sqlx::query(
         "SELECT COUNT(*) as cnt FROM channel_members cm \
          JOIN channels c ON cm.community_id = c.community_id AND cm.channel_id = c.id AND c.deleted_at IS NULL \
-         WHERE cm.community_id = $1 AND cm.channel_id = $2 AND cm.pubkey = $3 AND cm.removed_at IS NULL",
+         WHERE cm.community_id = $1 AND cm.channel_id = $2 AND cm.pubkey = $3 AND cm.removed_at IS NULL \
+         AND assigned_bot_access_allowed($1, $3, $2)",
     )
     .bind(community_id.as_uuid())
     .bind(channel_id)
@@ -909,7 +1037,8 @@ pub async fn is_member(
     let row = sqlx::query(
         "SELECT COUNT(*) as cnt FROM channel_members cm \
          JOIN channels c ON cm.community_id = c.community_id AND cm.channel_id = c.id AND c.deleted_at IS NULL \
-         WHERE cm.community_id = $1 AND cm.channel_id = $2 AND cm.pubkey = $3 AND cm.removed_at IS NULL",
+         WHERE cm.community_id = $1 AND cm.channel_id = $2 AND cm.pubkey = $3 AND cm.removed_at IS NULL \
+         AND assigned_bot_access_allowed($1, $3, $2)",
     )
     .bind(community_id.as_uuid())
     .bind(channel_id)
@@ -1220,10 +1349,12 @@ pub async fn get_accessible_channel_ids(
         FROM channel_members cm
         JOIN channels c ON cm.community_id = c.community_id AND cm.channel_id = c.id AND c.deleted_at IS NULL
         WHERE cm.community_id = $1 AND cm.pubkey = $2 AND cm.removed_at IS NULL
+          AND assigned_bot_access_allowed($1, $2, cm.channel_id)
         UNION
         SELECT id AS channel_id
         FROM channels
         WHERE community_id = $1 AND visibility = 'open' AND deleted_at IS NULL
+          AND assigned_bot_access_allowed($1, $2, id)
         "#,
     )
     .bind(community_id.as_uuid())
@@ -1456,6 +1587,7 @@ pub async fn get_accessible_channels(
         WHERE c.community_id = $1 AND c.deleted_at IS NULL
           {membership_clause}
           AND (c.channel_type != 'dm' OR cm.hidden_at IS NULL)
+          AND assigned_bot_access_allowed($1, $2, c.id)
     "#
     );
 
@@ -1684,7 +1816,8 @@ pub async fn get_member_role(
     let row = sqlx::query(
         "SELECT cm.role::text AS role FROM channel_members cm \
          JOIN channels c ON cm.community_id = c.community_id AND cm.channel_id = c.id AND c.deleted_at IS NULL \
-         WHERE cm.community_id = $1 AND cm.channel_id = $2 AND cm.pubkey = $3 AND cm.removed_at IS NULL",
+         WHERE cm.community_id = $1 AND cm.channel_id = $2 AND cm.pubkey = $3 AND cm.removed_at IS NULL \
+         AND assigned_bot_access_allowed($1, $3, $2)",
     )
     .bind(community_id.as_uuid())
     .bind(channel_id)

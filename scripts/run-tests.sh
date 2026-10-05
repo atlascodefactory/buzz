@@ -164,6 +164,10 @@ run_unit_tests() {
   run_test_step "buzz-acp unit tests" \
     cargo test -p buzz-acp --lib -- --nocapture
 
+  # Mirror the required nextest lane for the fail-closed assignment pin.
+  run_test_step "buzz-relay assigned-bot authority config tests" \
+    cargo test -p buzz-relay --lib assigned_bot_config::tests:: -- --nocapture
+
   # Mirror the relay filters from `just test-unit`: the three handler modules,
   # storage-snapshot helpers, readiness and router unit suites, and the single
   # scoped admission regression in state::tests, plus the REQ lifecycle tests.

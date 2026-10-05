@@ -705,7 +705,7 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 55);
+        assert_eq!(migrations.len(), 56);
         assert_eq!(migrations[48].version, 49);
         assert_eq!(migrations[49].version, 50);
         assert_eq!(migrations[50].version, 51);
@@ -713,6 +713,12 @@ mod postgres_tests {
         assert_eq!(migrations[52].version, 53);
         assert_eq!(migrations[53].version, 54);
         assert_eq!(migrations[54].version, 55);
+        assert_eq!(migrations[55].version, 56);
+        assert!(migrations[55]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE assigned_bots"));
+        assert!(!migrations[0].sql.as_str().contains("assigned_bots"));
         assert!(migrations[48]
             .sql
             .as_str()
@@ -2049,6 +2055,22 @@ mod postgres_tests {
         expected_fences.remove("product_feedback");
         expected_fences.remove("rate_limit_violations");
         expected_fences.extend(["artifact_heads", "artifact_revisions"].map(str::to_owned));
+        let assignment_migration = surface(
+            MIGRATOR
+                .iter()
+                .find(|migration| migration.version == 56)
+                .expect("embedded migration 0056")
+                .sql
+                .as_ref(),
+        );
+        assert_eq!(
+            assignment_migration.fence_attachments,
+            ["assigned_bots", "assigned_bot_commands"]
+                .map(str::to_owned)
+                .into_iter()
+                .collect()
+        );
+        expected_fences.extend(assignment_migration.fence_attachments);
         assert_eq!(
             expected_fences, schema.fence_attachments,
             "write-fence attachment targets differ after recovery policy"

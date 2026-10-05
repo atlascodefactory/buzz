@@ -348,6 +348,12 @@ pub const KIND_NIP29_CREATE_INVITE: u32 = 9009;
 /// Buzz conditional bot admission; see `docs/nips/conditional-bot-admission.md`.
 /// Unlike kind 9000, the conditions and mutation commit atomically.
 pub const KIND_CONDITIONAL_BOT_ADMISSION: u32 = 9010;
+/// Pinned external assignment-authority admission (not a human NIP-OA proof).
+/// Reserved until its transactional consumer is available; not advertised.
+pub const KIND_ASSIGNED_BOT_ADMISSION: u32 = 9011;
+/// Monotone revocation of an external bot assignment generation.
+/// Reserved until its transactional consumer is available; not advertised.
+pub const KIND_ASSIGNED_BOT_REVOCATION: u32 = 9012;
 /// NIP-29: Request to join a group.
 pub const KIND_NIP29_JOIN_REQUEST: u32 = 9021;
 /// NIP-29: Request to leave a group.

@@ -593,6 +593,9 @@ pub async fn restriction_state(
               UNION ALL
               SELECT agent_owner_pubkey FROM users
               WHERE community_id = $1 AND pubkey = $2 AND agent_owner_pubkey IS NOT NULL
+              UNION ALL
+              SELECT owner_pubkey FROM assigned_bots
+              WHERE community_id = $1 AND bot_pubkey = $2
           )
         "#,
     )

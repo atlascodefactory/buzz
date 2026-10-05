@@ -3,6 +3,8 @@
 //! NIP-01 WebSocket relay for Buzz private team communication.
 
 mod admission;
+/// Explicit per-community bot assignment-authority configuration.
+pub mod assigned_bot_config;
 mod build_info;
 mod rejection;
 
