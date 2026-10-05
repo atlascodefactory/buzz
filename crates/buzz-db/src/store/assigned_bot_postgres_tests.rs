@@ -4,6 +4,9 @@ use buzz_core::kind;
 use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
 use uuid::Uuid;
 
+#[path = "assigned_bot_phantom_postgres_tests.rs"]
+mod phantom_postgres_tests;
+
 struct Fixture {
     pool: PgPool,
     community: CommunityId,

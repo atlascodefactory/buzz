@@ -989,21 +989,70 @@ RETURNS BOOLEAN LANGUAGE sql STABLE SET search_path = public AS $$
     )
 $$;
 
+-- Cover first assignment INSERTs even when they bypass the Rust command helper.
+-- Do not add an UPDATE trigger that would invert tuple/advisory lock ordering.
+CREATE FUNCTION lock_assigned_bot_creation() RETURNS TRIGGER
+LANGUAGE plpgsql SET search_path = public AS $$
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtextextended(
+        'buzz_assigned_bot:' || NEW.community_id::text || ':' || encode(NEW.bot_pubkey, 'hex'), 0));
+    RETURN NEW;
+END
+$$;
+CREATE TRIGGER zz_assigned_bot_creation BEFORE INSERT ON assigned_bots
+FOR EACH ROW EXECUTE FUNCTION lock_assigned_bot_creation();
+
+-- A missing ban row cannot be row-locked. Mutations instead serialize with the
+-- event's predicate lock; the event never locks a community_bans tuple.
+CREATE FUNCTION lock_assigned_bot_ban_change() RETURNS TRIGGER
+LANGUAGE plpgsql SET search_path = public AS $$
+DECLARE
+    ban_key TEXT;
+BEGIN
+    FOR ban_key IN
+        SELECT DISTINCT keys.key FROM unnest(ARRAY[
+            CASE WHEN TG_OP <> 'INSERT' THEN
+                'buzz_assigned_bot_ban:' || OLD.community_id::text || ':' || encode(OLD.pubkey, 'hex') END,
+            CASE WHEN TG_OP <> 'DELETE' THEN
+                'buzz_assigned_bot_ban:' || NEW.community_id::text || ':' || encode(NEW.pubkey, 'hex') END
+        ]) AS keys(key) WHERE keys.key IS NOT NULL ORDER BY keys.key
+    LOOP
+        PERFORM pg_advisory_xact_lock(hashtextextended(ban_key, 0));
+    END LOOP;
+    IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+    RETURN NEW;
+END
+$$;
+CREATE TRIGGER zz_assigned_bot_ban_change BEFORE INSERT OR UPDATE OR DELETE ON community_bans
+FOR EACH ROW EXECUTE FUNCTION lock_assigned_bot_ban_change();
+
 -- Fence durable event insertion in its own transaction, including producers
 -- which do not enter the Relay's early statement-time authorization gate.
--- Row locks serialize existing assignment/identity/membership withdrawals with
--- commit. This is not a fence for a newly inserted ban, Git or delivery.
+-- Predicate locks cover assignment/ban absence; row locks hold existing
+-- assignment/identity/membership state. This is not a Git or delivery fence.
 CREATE FUNCTION enforce_assigned_bot_event_write() RETURNS TRIGGER
 LANGUAGE plpgsql VOLATILE SET search_path = public AS $$
 DECLARE
     owner_key BYTEA;
+    ban_key BYTEA;
 BEGIN
+    -- Match the command helper and creation trigger before testing absence.
+    PERFORM pg_advisory_xact_lock_shared(hashtextextended(
+        'buzz_assigned_bot:' || NEW.community_id::text || ':' || encode(NEW.pubkey, 'hex'), 0));
     SELECT a.owner_pubkey INTO owner_key FROM assigned_bots a
     WHERE a.community_id = NEW.community_id AND a.bot_pubkey = NEW.pubkey
     FOR SHARE;
     IF NOT FOUND THEN
         RETURN NEW;
     END IF;
+
+    FOR ban_key IN SELECT DISTINCT principals.pubkey
+        FROM unnest(ARRAY[NEW.pubkey, owner_key]) AS principals(pubkey)
+        ORDER BY principals.pubkey
+    LOOP
+        PERFORM pg_advisory_xact_lock_shared(hashtextextended(
+            'buzz_assigned_bot_ban:' || NEW.community_id::text || ':' || encode(ban_key, 'hex'), 0));
+    END LOOP;
 
     IF NEW.channel_id IS NOT NULL THEN
         -- The deferred TTL refresh and TTL transitions use this same key

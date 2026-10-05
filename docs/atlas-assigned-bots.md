@@ -70,7 +70,7 @@ instantaneous in-flight revocation from a `STABLE` SQL function. The remaining
 effect/commit-boundary and historical-response coverage is a launch prerequisite.
 
 The event table additionally fences author-bound durable INSERTs in their actual
-database transaction: existing assignment, owner/bot identity, direct owner Relay
+database transaction: assignment absence, owner/bot ban predicates, existing assignment, owner/bot identity, direct owner Relay
 membership and both channel memberships stay locked until commit. A volatile
 check takes a fresh snapshot after lock waits. Channel writes acquire the existing
 TTL shared lock before a `NO KEY UPDATE` channel-row lock, avoiding deferred TTL
@@ -80,8 +80,13 @@ removes only standalone copies before PostgreSQL recreates inherited triggers.
 Its named `42501` denial becomes a restricted write rejection in the common
 persist branches; unrelated database privilege failures remain internal errors.
 
-This partial fence does not cover a new assignment or ban inserted after a legacy
-absence check, or NIP-59 gift wraps whose event signer differs from their assigned
+First assignment creation shares the command helper's lifecycle lock, while ban
+mutations use separate, ordered principal locks. Both serialize against event
+commit even when the assignment or ban row did not exist yet. Legacy authors
+remain unrestricted by this assignment predicate; a new assignment is observed
+after a lock wait. This does not add a durable timeout (`muted_until`) fence.
+
+This partial fence does not cover NIP-59 gift wraps whose event signer differs from their assigned
 authenticated transport principal. Separate post-commit side effects, Git CAS,
 historical responses and live delivery still require their own authority fences.
 It is not permission to activate the complete product.
