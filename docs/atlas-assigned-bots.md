@@ -86,8 +86,18 @@ commit even when the assignment or ban row did not exist yet. Legacy authors
 remain unrestricted by this assignment predicate; a new assignment is observed
 after a lock wait. This does not add a durable timeout (`muted_until`) fence.
 
-This partial fence does not cover NIP-59 gift wraps whose event signer differs from their assigned
-authenticated transport principal. Separate post-commit side effects, Git CAS,
+NIP-59 gift-wrap persistence additionally fences the actual authenticated transport
+principal, not a claimed envelope/tag identity. The WebSocket-only ingest passes
+that principal to a kind-1059-only transaction with channel scope fixed to NULL.
+Community deletion is guarded first; both distinct lifecycle keys are ordered
+before any actor row locks. The existing volatile predicate/row fences then cover
+both authenticated actor and envelope signer through commit. Event and mention
+index now commit or roll back together on this path; a mention failure is an
+error, not successful delivery. Legacy unassigned actors keep ordinary access.
+The envelope is not rewritten, and no transport authorization comes from tags.
+
+This still is not a complete transport or product acceptance claim.
+Separate post-commit side effects, Git CAS,
 historical responses and live delivery still require their own authority fences.
 It is not permission to activate the complete product.
 

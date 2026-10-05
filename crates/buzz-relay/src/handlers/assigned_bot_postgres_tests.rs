@@ -8,6 +8,9 @@ use buzz_db::channel::{ChannelType, ChannelVisibility};
 use nostr::{EventBuilder, Keys, Kind, Tag};
 use sha2::{Digest, Sha256};
 
+#[path = "assigned_bot_gift_wrap_postgres_tests.rs"]
+mod gift_wrap_postgres_tests;
+
 struct Fixture {
     state: Arc<AppState>,
     tenant: TenantContext,

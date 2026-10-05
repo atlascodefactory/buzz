@@ -3498,7 +3498,15 @@ async fn ingest_event_inner(
     };
 
     let workflow_deletion = crate::handlers::side_effects::is_workflow_deletion(&event);
-    let (stored_event, was_inserted) = if workflow_deletion {
+    let (stored_event, was_inserted) = if is_gift_wrap {
+        // NIP-59's outer signer is ephemeral; authorization belongs to the
+        // authenticated actor. Keep both assignment fences through persistence.
+        state
+            .db
+            .insert_authenticated_gift_wrap(tenant.community(), &event, auth.pubkey())
+            .await
+            .map_err(map_event_persistence_error)?
+    } else if workflow_deletion {
         // A single commit owns public acceptance, domain mutation, and dispatch.
         // Failure rolls everything back; identical concurrent requests cannot
         // divide insertion and repair ownership between two relay workers.

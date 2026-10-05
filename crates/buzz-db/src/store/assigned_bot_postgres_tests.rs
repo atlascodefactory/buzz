@@ -7,6 +7,9 @@ use uuid::Uuid;
 #[path = "assigned_bot_phantom_postgres_tests.rs"]
 mod phantom_postgres_tests;
 
+#[path = "assigned_bot_gift_wrap_postgres_tests.rs"]
+mod gift_wrap_postgres_tests;
+
 struct Fixture {
     pool: PgPool,
     community: CommunityId,

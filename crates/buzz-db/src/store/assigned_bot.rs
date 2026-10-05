@@ -209,6 +209,70 @@ pub async fn filter_recipients(
     .await?)
 }
 
+impl crate::Db {
+    /// Persist a WebSocket gift wrap under its authenticated transport actor.
+    ///
+    /// The envelope's ephemeral signer is not transport authority. Both actors'
+    /// assignment fences, the event and mention rows share a single commit.
+    /// The caller must authenticate the actor and verify the signed envelope.
+    pub async fn insert_authenticated_gift_wrap(
+        &self,
+        community: CommunityId,
+        event: &nostr::Event,
+        actor: &nostr::PublicKey,
+    ) -> Result<(buzz_core::StoredEvent, bool)> {
+        let mut tx = self.begin_event_write_transaction().await?;
+        let result = self
+            .insert_authenticated_gift_wrap_in_transaction(&mut tx, community, event, actor)
+            .await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    async fn insert_authenticated_gift_wrap_in_transaction(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        community: CommunityId,
+        event: &nostr::Event,
+        actor: &nostr::PublicKey,
+    ) -> Result<(buzz_core::StoredEvent, bool)> {
+        if event.kind != nostr::Kind::GiftWrap {
+            return Err(DbError::InvalidData("expected gift-wrap envelope".into()));
+        }
+        self.deletion_store()
+            .guard_transaction(tx, community)
+            .await?;
+        let mut principals = vec![actor.to_bytes(), event.pubkey.to_bytes()];
+        principals.sort_unstable();
+        principals.dedup();
+        // Take both lifecycle predicates before any assignment/user row locks.
+        // Otherwise a reversed actor/envelope pair could invert command locks.
+        for principal in &principals {
+            sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))")
+                .bind(format!(
+                    "buzz_assigned_bot:{community}:{}",
+                    hex::encode(principal)
+                ))
+                .execute(&mut **tx)
+                .await?;
+        }
+        for principal in &principals {
+            sqlx::query("SELECT lock_assigned_bot_event_actor($1, $2, NULL)")
+                .bind(community.as_uuid())
+                .bind(principal.as_slice())
+                .execute(&mut **tx)
+                .await?;
+        }
+        let result =
+            crate::event::insert_event_with_thread_metadata_tx(tx, community, event, None, None)
+                .await?;
+        if result.1 {
+            crate::insert_mentions_in_transaction(tx, community, event, None).await?;
+        }
+        Ok(result)
+    }
+}
+
 #[cfg(test)]
 #[path = "assigned_bot_postgres_tests.rs"]
 mod postgres_tests;
