@@ -1399,7 +1399,11 @@ mod tests {
             .await
             .expect("real startup fence verification succeeds");
         let _ = crate::replica_fence::probe_once(&writer_pool, routed_db.fence()).await;
-        routed_db.fence().force_open_for_tests(Utc::now());
+        // Reader labels must not depend on how long the writer setup takes.
+        routed_db.fence().force_open_for_tests_at(
+            Utc::now(),
+            std::time::Instant::now() - Duration::from_secs(6),
+        );
         assert_eq!(
             writer_db
                 .readiness_check(tokio::time::Instant::now() + Duration::from_secs(1))
@@ -1495,7 +1499,11 @@ mod tests {
         let deletion_store = writer_db.deletion_store();
         let _ = deletion_store.reap_expired_serving_write_leases(1).await;
         let _ = deletion_store.serving_lease_stats().await;
+        // Start each routed reader operation with a fresh fixture sample, even
+        // when the preceding writer operations outlive the five-second budget.
+        routed_db.fence().force_open_for_tests(Utc::now());
         let _ = routed_db.is_relay_member(test_scope, &"a".repeat(64)).await;
+        routed_db.fence().force_open_for_tests(Utc::now());
         let _ = routed_db
             .query_events_routed("pool_operation_matrix_reader", &query)
             .await;

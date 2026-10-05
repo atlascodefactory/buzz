@@ -2709,7 +2709,7 @@ async fn context_recovery_budget_exhaustion_surfaces_the_error() {
     assert_context_recovery_budget_exhaustion(false).await;
 }
 
-/// The same real provider/ACP scenario with stderr collection held until after
+/// The same real provider/ACP scenario with stderr visibility held until after
 /// the stdout response. The old immediate snapshot cannot observe the budget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn context_recovery_budget_exhaustion_waits_for_delayed_stderr() {
@@ -2786,14 +2786,14 @@ async fn assert_context_recovery_budget_exhaustion(delay_stderr: bool) {
                 !h.stderr_text().contains("context recovery budget spent"),
                 "the old immediate snapshot must miss the held diagnostic"
             );
-            // Prove the actual wait stays pending before releasing the collector,
+            // Prove the actual wait stays pending before releasing buffered output,
             // without a sleep or depending on how quickly either task runs.
             std::future::poll_fn(|cx| {
                 assert!(std::future::Future::poll(wait.as_mut(), cx).is_pending());
                 std::task::Poll::Ready(())
             })
             .await;
-            release_stderr.send(()).expect("release stderr collection");
+            release_stderr.send(()).expect("release stderr visibility");
         }
         wait.await
     };

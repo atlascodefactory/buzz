@@ -304,7 +304,11 @@ async fn readiness_check_cancellation_balances_waiter_and_inflight_connection() 
                 .await;
             match outcome {
                 DbReadinessOutcome::Success => break outcome,
-                DbReadinessOutcome::PoolTimeout => tokio::task::yield_now().await,
+                // Acquisition and query share the round's absolute deadline;
+                // either phase may consume it while a replacement is created.
+                DbReadinessOutcome::PoolTimeout | DbReadinessOutcome::QueryTimeout => {
+                    tokio::task::yield_now().await
+                }
                 unexpected => panic!(
                     "cancelled in-flight query produced unexpected recovery outcome: {unexpected:?}"
                 ),
@@ -1874,15 +1878,23 @@ async fn routed_fallback_spends_one_acquire_budget_when_aurora_cache_is_cold() {
     })
     .await
     .expect("connect armed Db with size-1 lazy reader");
-    db.fence().force_open_for_tests(chrono::Utc::now());
     db.set_replica_read_max_age_for_tests(Some(Duration::from_secs(5)));
 
     let read_pool = db.read_pool.clone().expect("reader pool configured");
-    // Establish and hold the reader's only connection: saturated.
-    let held = read_pool
-        .acquire()
-        .await
-        .expect("establish the reader's sole connection");
+    // Establish and hold the real reader's only connection before timing the
+    // saturated-pool route. Cold connection setup may exceed its 150ms acquire
+    // budget under load; retry only preparation, without changing pool options.
+    let held = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match read_pool.acquire().await {
+                Err(sqlx::Error::PoolTimedOut) => continue,
+                result => break result,
+            }
+        }
+    })
+    .await
+    .expect("reader preparation must finish within 5s")
+    .expect("establish the reader's sole connection");
     assert_eq!(
         db.read_max_connections, 1,
         "reader max must report 1 for this fixture to test saturation"
@@ -1911,6 +1923,7 @@ async fn routed_fallback_spends_one_acquire_budget_when_aurora_cache_is_cold() {
     // a multi-thread runtime the emit could land on a worker where no
     // local recorder is installed and the label assertions would vacuously
     // see an empty snapshot.
+    db.fence().force_open_for_tests(chrono::Utc::now());
     let start = std::time::Instant::now();
     let count = {
         let _guard = metrics::set_default_local_recorder(&recorder);

@@ -1,6 +1,7 @@
 mod connection_observability;
 pub mod migration;
 pub(crate) mod observability;
+mod readiness;
 pub mod replica_fence;
 
 pub use connection_observability::{DbConnectionOutcome, DbConnectionStep};
@@ -1146,7 +1147,7 @@ impl Db {
         deadline: tokio::time::Instant,
         query: &'static str,
     ) -> DbReadinessOutcome {
-        let mut connection = match observability::acquire_writer_until(
+        let connection = match observability::acquire_writer_until(
             &self.pool,
             observability::WriterOperation::Readiness,
             deadline,
@@ -1161,8 +1162,7 @@ impl Db {
             Ok(connection) => connection,
         };
 
-        match tokio::time::timeout_at(deadline, sqlx::query(query).execute(&mut *connection)).await
-        {
+        match readiness::execute(connection, deadline, query).await {
             Err(_) => DbReadinessOutcome::QueryTimeout,
             Ok(Err(error)) => {
                 tracing::debug!(error = %error, "Postgres readiness query failed");

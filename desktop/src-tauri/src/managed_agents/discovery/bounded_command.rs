@@ -16,9 +16,8 @@ use std::time::{Duration, Instant};
 /// Poll interval while waiting for the child to exit.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Idle backoff for a nonblocking Unix drain that has no bytes available and
-/// has not yet been told to stop. Short so a running child's output is pulled
-/// promptly and the post-teardown join returns quickly.
+/// Maximum readiness wait for an idle Unix drain. Data wakes it immediately;
+/// the bound lets an escaped writer's drain observe teardown promptly.
 #[cfg(unix)]
 const DRAIN_IDLE_POLL: Duration = Duration::from_millis(5);
 
@@ -235,6 +234,38 @@ fn set_nonblocking<F: std::os::unix::io::AsRawFd>(f: &F) -> bool {
     }
 }
 
+/// Wait for data without imposing a sleep after every empty read. Small pipe
+/// buffers can otherwise throttle a streaming child to one chunk per sleep.
+#[cfg(unix)]
+fn wait_for_pipe_input<R: std::os::unix::io::AsRawFd>(reader: &R) -> std::io::Result<()> {
+    let mut fd = libc::pollfd {
+        fd: reader.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: the drain owns reader throughout this bounded poll; fd borrows
+    // its descriptor and points to one initialized pollfd for the call.
+    let result = unsafe { libc::poll(&mut fd, 1, DRAIN_IDLE_POLL.as_millis() as i32) };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    if fd.revents & libc::POLLNVAL != 0 {
+        return Err(std::io::Error::from(ErrorKind::InvalidInput));
+    }
+    // Timeout/interruption returns to the stop check. HUP/ERR returns to read,
+    // which drains buffered bytes or reports EOF/the underlying error.
+    Ok(())
+}
+
+#[cfg(windows)]
+fn wait_for_pipe_input<R>(_: &R) -> std::io::Result<()> {
+    // Windows drains use blocking reads; their idle callback is never called.
+    Ok(())
+}
+
 /// Drain one child stream on its own thread into a buffer capped by the shared
 /// aggregate budget, so the sink itself — not a post-hoc size sample — enforces
 /// [`CAPTURE_LIMIT`].
@@ -269,11 +300,12 @@ fn spawn_drain<R: Read + Send + 'static>(
     total: Arc<AtomicU64>,
     overflow: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    wait_for_input: fn(&R) -> std::io::Result<()>,
 ) -> JoinHandle<std::io::Result<Vec<u8>>> {
     // `stop` gates only the nonblocking Unix drain; the Windows path blocks to
     // the job-close EOF and never consults it.
     #[cfg(windows)]
-    let _ = &stop;
+    let _ = (&stop, wait_for_input);
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 8192];
@@ -307,14 +339,14 @@ fn spawn_drain<R: Read + Send + 'static>(
                 // Nonblocking read (Unix only): no bytes available right now.
                 // After teardown, an escaped out-of-group writer is the only
                 // thing that could still hold the pipe open, so stop draining it
-                // rather than block the join forever; otherwise back off and
-                // retry so a running child's later output is still captured.
+                // rather than block the join forever; otherwise wait for data
+                // with a bounded readiness poll, then recheck the stop flag.
                 #[cfg(unix)]
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
                     if stop.load(Ordering::Relaxed) {
                         return Ok(buf);
                     }
-                    std::thread::sleep(DRAIN_IDLE_POLL);
+                    wait_for_input(&reader)?;
                 }
                 Err(e) => return Err(e),
             }
@@ -399,10 +431,24 @@ pub(crate) fn output_with_timeout(mut command: Command, timeout: Duration) -> Op
     let total = Arc::new(AtomicU64::new(0));
     let overflow = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
-    let stdout_drain =
-        stdout_pipe.map(|s| spawn_drain(s, total.clone(), overflow.clone(), stop.clone()));
-    let stderr_drain =
-        stderr_pipe.map(|s| spawn_drain(s, total.clone(), overflow.clone(), stop.clone()));
+    let stdout_drain = stdout_pipe.map(|s| {
+        spawn_drain(
+            s,
+            total.clone(),
+            overflow.clone(),
+            stop.clone(),
+            wait_for_pipe_input,
+        )
+    });
+    let stderr_drain = stderr_pipe.map(|s| {
+        spawn_drain(
+            s,
+            total.clone(),
+            overflow.clone(),
+            stop.clone(),
+            wait_for_pipe_input,
+        )
+    });
 
     let deadline = Instant::now() + timeout;
     let status = loop {
@@ -634,7 +680,9 @@ mod tests {
         // since a continuously-ready reader never hits the `WouldBlock` arm that
         // consults it. The overflow return is the only thing that can bound it.
         let stop = Arc::new(AtomicBool::new(true));
-        let drain = spawn_drain(AlwaysReady, total.clone(), overflow.clone(), stop);
+        let drain = spawn_drain(AlwaysReady, total.clone(), overflow.clone(), stop, |_| {
+            panic!("a continuously readable drain must never wait for input")
+        });
 
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {

@@ -22,6 +22,7 @@ const METRICS_SCRAPE_DEADLINE: Duration = Duration::from_secs(8);
 
 struct RelayProcess {
     child: Option<Child>,
+    stdout_started: mpsc::Receiver<Instant>,
     stdout: Option<JoinHandle<CapturedStream>>,
     stderr: Option<JoinHandle<CapturedStream>>,
     scratch_dir: std::path::PathBuf,
@@ -51,10 +52,12 @@ impl RelayProcess {
         let mut child = command.spawn().expect("spawn buzz-relay child process");
         let stdout = child.stdout.take().expect("relay stdout pipe");
         let stderr = child.stderr.take().expect("relay stderr pipe");
+        let (started, stdout_started) = mpsc::channel();
         Self {
             child: Some(child),
-            stdout: Some(thread::spawn(move || capture_stream(stdout))),
-            stderr: Some(thread::spawn(move || capture_stream(stderr))),
+            stdout_started,
+            stdout: Some(thread::spawn(move || capture_stream(stdout, Some(started)))),
+            stderr: Some(thread::spawn(move || capture_stream(stderr, None))),
             scratch_dir,
         }
     }
@@ -111,7 +114,10 @@ impl Drop for RelayProcess {
     }
 }
 
-fn capture_stream(mut stream: impl std::io::Read) -> CapturedStream {
+fn capture_stream(
+    mut stream: impl std::io::Read,
+    mut started: Option<mpsc::Sender<Instant>>,
+) -> CapturedStream {
     let mut retained = Vec::new();
     let mut total_bytes = 0_u64;
     let mut chunk = [0_u8; 8192];
@@ -119,6 +125,9 @@ fn capture_stream(mut stream: impl std::io::Read) -> CapturedStream {
         let read = stream.read(&mut chunk).expect("read relay output pipe");
         if read == 0 {
             break;
+        }
+        if let Some(started) = started.take() {
+            let _ = started.send(Instant::now());
         }
         total_bytes = total_bytes.saturating_add(u64::try_from(read).expect("read size fits u64"));
         let remaining = usize::try_from(MAX_CAPTURE_BYTES)
@@ -647,8 +656,11 @@ mod postgres_tests {
     /// passes. Unlike `run_relay`, a relay that keeps serving is a result to
     /// assert on rather than a panic, which is the whole point here.
     fn run_until_exit(environment: &[(&str, &str)], timeout: Duration) -> (bool, Output) {
-        let mut process = RelayProcess::spawn(environment);
-        let deadline = Instant::now() + timeout;
+        let process = RelayProcess::spawn(environment);
+        wait_until_exit(process, Instant::now() + timeout)
+    }
+
+    fn wait_until_exit(mut process: RelayProcess, deadline: Instant) -> (bool, Output) {
         while Instant::now() < deadline {
             if process.try_wait().is_some() {
                 return (true, process.wait(Duration::from_secs(2)));
@@ -730,19 +742,22 @@ mod postgres_tests {
         let health_port = reserve_closed_port();
         let health_port_value = health_port.to_string();
         let timeout = REDIS_BOOTSTRAP_BUDGET + REDIS_BOOTSTRAP_SCHEDULING_SLACK;
-        let started_at = Instant::now();
-
-        let (exited, output) = run_until_exit(
-            &[
-                ("BUZZ_RELAY_PRIVATE_KEY", VALID_RELAY_PRIVATE_KEY),
-                ("BUZZ_METRICS_PORT", &metrics_port),
-                ("BUZZ_HEALTH_PORT", &health_port_value),
-                ("DATABASE_URL", &database_url),
-                ("REDIS_URL", redis_peer.redis_url()),
-                ("BUZZ_GIT_CONFORMANCE_PROBE", "false"),
-            ],
-            timeout,
-        );
+        let process = RelayProcess::spawn(&[
+            ("BUZZ_RELAY_PRIVATE_KEY", VALID_RELAY_PRIVATE_KEY),
+            ("BUZZ_METRICS_PORT", &metrics_port),
+            ("BUZZ_HEALTH_PORT", &health_port_value),
+            ("DATABASE_URL", &database_url),
+            ("REDIS_URL", redis_peer.redis_url()),
+            ("BUZZ_GIT_CONFORMANCE_PROBE", "false"),
+        ]);
+        // Delay before the first observed startup output is preparation.
+        // Bound it separately, then retain the original bootstrap budget +
+        // scheduling slack from the capture reader's first output timestamp.
+        let started_at = process
+            .stdout_started
+            .recv_timeout(CHILD_TIMEOUT)
+            .expect("relay must produce startup output within the child watchdog");
+        let (exited, output) = wait_until_exit(process, started_at + timeout);
         let elapsed = started_at.elapsed();
         let logs = format!(
             "{}{}",

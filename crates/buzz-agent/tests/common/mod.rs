@@ -116,8 +116,8 @@ impl Harness {
         Self::spawn_with_stderr_gate(base_url, extra, None).await
     }
 
-    /// Delay stderr collection until released, to exercise stdout/stderr ordering
-    /// without changing the child or relying on scheduler timing.
+    /// Delay stderr visibility until released, to exercise stdout/stderr ordering
+    /// while continuously draining the pipe so the child can still make progress.
     pub async fn spawn_with_stderr_gate(
         base_url: &str,
         extra: &[(&str, &str)],
@@ -148,12 +148,8 @@ impl Harness {
         let stderr_out = Arc::clone(&stderr_buf);
         let stderr_changed = Arc::new(Notify::new());
         let changed = Arc::clone(&stderr_changed);
+        let (stderr_lines, mut collected_lines) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
-            if let Some(gate) = stderr_gate {
-                // Dropping the sender (e.g. on assertion failure) also unblocks
-                // collection, rather than leaving a detached reader waiting.
-                let _ = gate.await;
-            }
             let mut reader = BufReader::new(stderr);
             let mut line = String::new();
             loop {
@@ -165,6 +161,18 @@ impl Harness {
                 if n == 0 {
                     break;
                 }
+                if stderr_lines.send(std::mem::take(&mut line)).is_err() {
+                    break;
+                }
+            }
+        });
+        tokio::spawn(async move {
+            if let Some(gate) = stderr_gate {
+                // Dropping the sender (e.g. on assertion failure) also releases
+                // the buffered lines. Pipe draining never waits for this gate.
+                let _ = gate.await;
+            }
+            while let Some(line) = collected_lines.recv().await {
                 if let Ok(mut out) = stderr_out.lock() {
                     out.push_str(&line);
                 }
