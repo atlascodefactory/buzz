@@ -132,6 +132,16 @@ Separate post-commit side effects, Git CAS,
 historical responses and live delivery still require their own authority fences.
 It is not permission to activate the complete product.
 
+The assignment lookup now requires the writer even for an open relay or an
+otherwise unassigned caller: an unavailable database cannot safely establish
+that a key has no withdrawn assignment. This fails closed rather than retaining
+the former no-database open-relay shortcut. Audio admission races that lookup
+against cancellation so an admin disconnect or session expiry can deliver its
+terminal denial without waiting for the database timeout. Off-mode lookup
+failure uses the relay-membership refusal frame; it is no longer a later
+channel-membership error. Unavailable dependency and explicit denial remain
+distinct under NIP-FI.
+
 ## Git rights, not a blanket denial
 
 An active assigned bot remains eligible for ordinary repository/branch/approval
