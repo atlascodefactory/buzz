@@ -653,6 +653,13 @@ pub(super) async fn authorize_git_read(
         (StatusCode::NOT_FOUND, "repository not found").into_response()
     }
 
+    if buzz_db::assigned_bot::access_status(db.pool(), community, caller.as_bytes(), None)
+        .await
+        .map_err(|_| denied())?
+        == Some(false)
+    {
+        return Err(denied());
+    }
     let Ok(owner_bytes) = hex::decode(owner_hex) else {
         return Err(denied());
     };

@@ -62,7 +62,7 @@ pub(crate) use runtime::{
     RoutePredicate,
 };
 pub use store::{
-    admin_moderation, allowlist, api_token, archived_identities, artifact, channel,
+    admin_moderation, allowlist, api_token, archived_identities, artifact, assigned_bot, channel,
     channel_members, community, deletion, dm, event, feed, git_repo, moderation, operator_listener,
     partition, product_feedback, push, reaction, read_state, relay_admin_actions, relay_invite,
     relay_members, relay_operators, reminder, replaceable, storage_accounting, thread,

@@ -1761,8 +1761,7 @@ mod tests {
         builder.body(Body::empty()).expect("request")
     }
 
-    #[tokio::test]
-    async fn media_reads_reject_unauthenticated_get_and_head_before_sidecar_gate() {
+    async fn media_reads_reject_unauthenticated_get_and_head_before_sidecar_gate_body() {
         for method in ["GET", "HEAD"] {
             let response = media_get_auth_router()
                 .await
@@ -1774,8 +1773,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn media_read_with_valid_server_scoped_token_reaches_sidecar_gate() {
+    async fn media_read_with_valid_server_scoped_token_reaches_sidecar_gate_body() {
         let keys = Keys::generate();
         let auth = media_get_auth_header(&keys, media_get_tags_for("relay.example", None));
         let response = media_get_auth_router()
@@ -1787,8 +1785,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
-    async fn media_read_rejects_upload_verb_wrong_server_and_wrong_x() {
+    async fn media_read_rejects_upload_verb_wrong_server_and_wrong_x_body() {
         let keys = Keys::generate();
         let now = Timestamp::now().as_secs();
         let expiration = (now + 55).to_string();
@@ -1828,8 +1825,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn media_read_accepts_range_header_only_after_auth() {
+    async fn media_read_accepts_range_header_only_after_auth_body() {
         let keys = Keys::generate();
         let auth = media_get_auth_header(&keys, media_get_tags_for("relay.example", None));
         let mut request = media_request("GET", Some(auth));
@@ -1846,8 +1842,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
-    async fn upload_rate_limiter_is_scoped_by_community() {
+    async fn upload_rate_limiter_is_scoped_by_community_body() {
         let state = test_state().await;
         let pubkey = nostr::Keys::generate().public_key();
         let community_a = buzz_core::CommunityId::from_uuid(Uuid::from_u128(0xAAAA));
@@ -1861,8 +1856,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn upload_concurrency_limit_is_scoped_by_community() {
+    async fn upload_concurrency_limit_is_scoped_by_community_body() {
         let state = test_state().await;
         let pubkey = nostr::Keys::generate().public_key();
         let community_a = buzz_core::CommunityId::from_uuid(Uuid::from_u128(0xAAAA));
@@ -2101,6 +2095,36 @@ mod tests {
     // [FI-TRACE-AUTHORITY-UNIFORM, FI-INV-15]
     #[cfg(test)]
     mod postgres_tests {
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn media_reads_reject_unauthenticated_get_and_head_before_sidecar_gate() {
+            super::media_reads_reject_unauthenticated_get_and_head_before_sidecar_gate_body().await;
+        }
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn media_read_with_valid_server_scoped_token_reaches_sidecar_gate() {
+            super::media_read_with_valid_server_scoped_token_reaches_sidecar_gate_body().await;
+        }
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn media_read_rejects_upload_verb_wrong_server_and_wrong_x() {
+            super::media_read_rejects_upload_verb_wrong_server_and_wrong_x_body().await;
+        }
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn media_read_accepts_range_header_only_after_auth() {
+            super::media_read_accepts_range_header_only_after_auth_body().await;
+        }
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn upload_rate_limiter_is_scoped_by_community() {
+            super::upload_rate_limiter_is_scoped_by_community_body().await;
+        }
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn upload_concurrency_limit_is_scoped_by_community() {
+            super::upload_concurrency_limit_is_scoped_by_community_body().await;
+        }
         use super::*;
         use std::sync::Arc;
 

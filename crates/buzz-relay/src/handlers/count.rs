@@ -37,6 +37,30 @@ pub async fn handle_count(
         }
     };
 
+    match buzz_db::assigned_bot::access_status(
+        state.db.pool(),
+        conn.tenant.community(),
+        &pubkey_bytes,
+        None,
+    )
+    .await
+    {
+        Ok(Some(false)) => {
+            conn.send(RelayMessage::closed(
+                &sub_id,
+                "restricted: assigned agent access withdrawn",
+            ));
+            return;
+        }
+        Err(_) => {
+            conn.send(RelayMessage::closed(
+                &sub_id,
+                "error: authorization unavailable",
+            ));
+            return;
+        }
+        _ => {}
+    }
     // P-gated kinds (gift wraps, member notifications, observer frames) require
     // the caller's own pubkey in the #p tag — same enforcement as WS REQ handler.
     let authed_pubkey_hex = hex::encode(&pubkey_bytes);

@@ -94,6 +94,30 @@ pub async fn handle_req(
         }
     };
 
+    match buzz_db::assigned_bot::access_status(
+        state.db.pool(),
+        conn.tenant.community(),
+        &pubkey_bytes,
+        None,
+    )
+    .await
+    {
+        Ok(Some(false)) => {
+            conn.send(RelayMessage::closed(
+                &sub_id,
+                "restricted: assigned agent access withdrawn",
+            ));
+            return;
+        }
+        Err(_) => {
+            conn.send(RelayMessage::closed(
+                &sub_id,
+                "error: authorization unavailable",
+            ));
+            return;
+        }
+        _ => {}
+    }
     let channel_id = extract_channel_id_from_filters(&filters);
     let requested_channel_ids = match extract_channel_ids_from_filters_limited(&filters) {
         Ok(ids) => ids,
@@ -3417,8 +3441,7 @@ mod tests {
     //      `assert_eq!(query_count, 0)` panics.
     //   C) Change gate to `off_mode` → `acquire_effect()` always succeeds →
     //      same as (B).
-    #[tokio::test]
-    async fn p1a_huddle_liveness_req_barrier_expiry_blocks_query_and_emission() {
+    async fn p1a_huddle_liveness_req_barrier_expiry_blocks_query_and_emission_body() {
         use nostr::{Filter, Keys};
         use std::collections::HashMap;
         use std::sync::Arc;
@@ -3662,16 +3685,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn expiry_during_stalled_history_read_releases_permit_and_claim() {
-        expiry_during_stalled_read_releases_permit(0x0000_0001_7224_0001, false).await;
-    }
-
-    #[tokio::test]
-    async fn expiry_during_stalled_search_read_releases_permit_and_claim() {
-        expiry_during_stalled_read_releases_permit(0x0000_0001_7224_0002, true).await;
-    }
-
     // ── History statement timeout racing expiry ───────────────────────────────
     //
     // Drives the production history read into a real statement timeout (a lock
@@ -3813,6 +3826,24 @@ mod tests {
     }
 
     mod postgres_tests {
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn p1a_huddle_liveness_req_barrier_expiry_blocks_query_and_emission() {
+            super::p1a_huddle_liveness_req_barrier_expiry_blocks_query_and_emission_body().await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn expiry_during_stalled_history_read_releases_permit_and_claim() {
+            super::expiry_during_stalled_read_releases_permit(0x0000_0001_7224_0001, false).await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn expiry_during_stalled_search_read_releases_permit_and_claim() {
+            super::expiry_during_stalled_read_releases_permit(0x0000_0001_7224_0002, true).await;
+        }
+
         #[tokio::test]
         #[ignore = "requires Postgres"]
         async fn w3_b2_req_barrier_expiry_mid_flight_blocks_subscription_registration() {

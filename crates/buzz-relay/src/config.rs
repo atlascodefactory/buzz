@@ -116,6 +116,9 @@ pub const MAX_DRAIN_JITTER_MS: u64 = 20_000;
 /// Relay runtime configuration, loaded from environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Optional authority for exactly one community's assigned bots. Unset means
+    /// kinds 9011/9012 always deny; no legacy/operator/login authority fallback.
+    pub assigned_bot_authority: Option<crate::assigned_bot_config::AssignedBotAuthority>,
     /// Address the relay HTTP/WebSocket server binds to.
     pub bind_addr: SocketAddr,
     /// Postgres database connection URL.
@@ -1333,6 +1336,14 @@ impl Config {
         }
 
         Ok(Self {
+            assigned_bot_authority: crate::assigned_bot_config::AssignedBotAuthority::parse(
+                std::env::var("BUZZ_ASSIGNED_BOT_COMMUNITY_ID")
+                    .ok()
+                    .as_deref(),
+                std::env::var("BUZZ_ASSIGNED_BOT_AUTHORITY_PUBKEY")
+                    .ok()
+                    .as_deref(),
+            )?,
             bind_addr,
             database_url,
             read_database_url,

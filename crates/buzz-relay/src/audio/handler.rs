@@ -724,15 +724,28 @@ pub(crate) async fn handle_active_audio_connection(
     // NIP-OA owner of a delegated agent: from relay membership on a closed
     // relay, or straight from the self-proving auth tag on an open one.
     let mut nip_oa_owner = None;
-    let relay_refusal = match crate::api::relay_members::check_relay_membership(
-        &state,
-        tenant.community(),
-        pubkey.as_bytes(),
-        auth_tag_json.as_deref(),
-        Some(signed_auth_created_at),
-    )
-    .await
-    {
+    // Assignment checks use the writer even on open relays. Cancellation must
+    // win over a stalled dependency lookup, including after an admin scan has
+    // already queued its terminal denial frame.
+    let relay_membership = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            crate::connection::send_exit_frames_bounded(
+                &mut ws_send,
+                terminal_exit_frames(&mut terminal_ctrl_rx, &disconnect_reason),
+            )
+            .await;
+            return;
+        },
+        result = crate::api::relay_members::check_relay_membership(
+            &state,
+            tenant.community(),
+            pubkey.as_bytes(),
+            auth_tag_json.as_deref(),
+            Some(signed_auth_created_at),
+        ) => result,
+    };
+    let relay_refusal = match relay_membership {
         Ok(crate::api::relay_members::MembershipDecision::Denied) => {
             warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "audio: relay membership denied");
             Some(buzz_auth::DenialClass::AuthorizationDenied)
@@ -4409,10 +4422,10 @@ mod tests {
         );
     }
 
-    /// A channel-membership lookup failure is an unreadable dependency.
-    /// Mutation: map `AdmissionRefusal::Dependency` to `AuthorizationDenied` → RED.
+    /// Even an open relay now reads assignment state before channel membership.
+    /// An unavailable assignment dependency must not become an allow shortcut.
     #[tokio::test]
-    async fn audio_channel_membership_lookup_failure_with_fi_emits_authorization_unavailable() {
+    async fn audio_open_relay_assignment_lookup_failure_with_fi_emits_authorization_unavailable() {
         assert_eq!(
             run_audio_auth_with_failing_db(false, true).await,
             vec![audio_denial(
@@ -4422,11 +4435,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audio_channel_membership_lookup_failure_off_mode_keeps_legacy_frame() {
+    async fn audio_open_relay_assignment_lookup_failure_off_mode_uses_relay_refusal_frame() {
         assert_eq!(
             run_audio_auth_with_failing_db(false, false).await,
-            vec![serde_json::json!({"type": "error", "message": "not a member"}).to_string()]
+            vec![
+                serde_json::json!({"type": "error", "message": "restricted: not a relay member"})
+                    .to_string()
+            ]
         );
+    }
+
+    /// Exercise the channel admission seam separately: an open relay no longer
+    /// skips the earlier assignment lookup, so the wire tests stop before here.
+    #[tokio::test]
+    async fn audio_channel_membership_lookup_failure_remains_dependency_refusal() {
+        let state = audio_test_state_with(false, Some(Duration::from_millis(100))).await;
+        let tenant = TenantContext::resolved(
+            buzz_core::CommunityId::from_uuid(Uuid::new_v4()),
+            "test.local".to_owned(),
+        );
+        let result = check_membership_for_admission(
+            &state,
+            &tenant,
+            Uuid::new_v4(),
+            nostr::Keys::generate().public_key().as_bytes(),
+            None,
+        )
+        .await;
+        match result {
+            Err(refusal @ AdmissionRefusal::Dependency(_)) => assert_eq!(
+                refusal.denial_class(),
+                buzz_auth::DenialClass::AuthorizationUnavailable
+            ),
+            _ => panic!("an unreadable channel must fail closed as a dependency refusal"),
+        }
     }
 
     /// Under NIP-FI a failed NIP-42 proof is classified like the root route:

@@ -8,6 +8,8 @@ pub mod allowlist;
 pub mod api_token;
 /// Relay-scoped archived identity persistence (NIP-IA).
 pub mod archived_identities;
+/// Separately attested bot lifecycle and conditional admission persistence.
+pub mod assigned_bot;
 /// Channel lifecycle and metadata persistence.
 pub mod channel;
 /// Channel membership and roster persistence.

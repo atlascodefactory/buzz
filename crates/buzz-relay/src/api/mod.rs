@@ -94,6 +94,8 @@ pub mod relay_members {
         OpenRelay,
         /// Caller is directly present in `relay_members`.
         Member,
+        /// A stored Atlas assignment grants bot authentication, not NIP-OA ownership.
+        AssignedBot,
         /// Caller is admitted through a NIP-OA owner that is a relay member.
         ViaOwner(nostr::PublicKey),
         /// Caller is not admitted.
@@ -178,6 +180,20 @@ pub mod relay_members {
         signed_auth_created_at: Option<u64>,
         writer: bool,
     ) -> Result<MembershipDecision, String> {
+        // Always use the writer for assignments. This gate precedes open-relay,
+        // direct-member and genuine NIP-OA shortcuts, and survives pin removal.
+        // Owner departure must not be hidden by a stale membership replica.
+        if let Some(allowed) =
+            buzz_db::assigned_bot::access_status(state.db.pool(), community, pubkey_bytes, None)
+                .await
+                .map_err(|e| format!("assigned relay membership check failed: {e}"))?
+        {
+            return Ok(if allowed {
+                MembershipDecision::AssignedBot
+            } else {
+                MembershipDecision::Denied
+            });
+        }
         if !state.config.require_relay_membership {
             return Ok(MembershipDecision::OpenRelay);
         }
@@ -255,7 +271,11 @@ pub mod relay_members {
         )
         .await
         {
-            Ok(MembershipDecision::OpenRelay) | Ok(MembershipDecision::Member) => {
+            Ok(
+                MembershipDecision::OpenRelay
+                | MembershipDecision::Member
+                | MembershipDecision::AssignedBot,
+            ) => {
                 deny_banned(
                     state,
                     community,

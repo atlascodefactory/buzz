@@ -80,6 +80,9 @@ pub const EXPECTED_SCOPED_TABLES: &[&str] = &[
     "archived_identities",
     "artifact_heads",
     "artifact_revisions",
+    "assigned_bot_commands",
+    "assigned_bot_inspections",
+    "assigned_bots",
     "audit_log",
     "channel_members",
     "channels",
@@ -110,6 +113,9 @@ pub const EXPECTED_SCOPED_TABLES: &[&str] = &[
 
 /// Foreign-key-safe child-before-parent order for the PostgreSQL purge.
 pub const PURGE_SCOPED_TABLES: &[&str] = &[
+    "assigned_bot_commands",
+    "assigned_bot_inspections",
+    "assigned_bots",
     "workflow_approvals",
     "scheduled_workflow_fires",
     "workflow_runs",
