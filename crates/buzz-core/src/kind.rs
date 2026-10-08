@@ -354,6 +354,8 @@ pub const KIND_ASSIGNED_BOT_ADMISSION: u32 = 9011;
 /// Monotone revocation of an external bot assignment generation.
 /// Reserved until its transactional consumer is available; not advertised.
 pub const KIND_ASSIGNED_BOT_REVOCATION: u32 = 9012;
+/// Pinned authority's single-use, scoped assignment observation (not admission).
+pub const KIND_ASSIGNED_BOT_INSPECTION: u32 = 9013;
 /// NIP-29: Request to join a group.
 pub const KIND_NIP29_JOIN_REQUEST: u32 = 9021;
 /// NIP-29: Request to leave a group.

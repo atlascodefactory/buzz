@@ -2065,10 +2065,14 @@ mod postgres_tests {
         );
         assert_eq!(
             assignment_migration.fence_attachments,
-            ["assigned_bots", "assigned_bot_commands"]
-                .map(str::to_owned)
-                .into_iter()
-                .collect()
+            [
+                "assigned_bots",
+                "assigned_bot_commands",
+                "assigned_bot_inspections"
+            ]
+            .map(str::to_owned)
+            .into_iter()
+            .collect()
         );
         expected_fences.extend(assignment_migration.fence_attachments);
         assert_eq!(

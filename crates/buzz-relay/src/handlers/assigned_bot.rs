@@ -46,10 +46,10 @@ pub async fn accept(
             }
             Some(channel_id)
         }
-        AssignedBotOperation::Revoke => {
+        AssignedBotOperation::Revoke | AssignedBotOperation::Inspect { .. } => {
             if token_channels.is_some() {
                 return Err(IngestError::AuthFailed(
-                    "restricted: assignment revocation requires a global token".into(),
+                    "restricted: assignment operation requires a global token".into(),
                 ));
             }
             None
@@ -64,17 +64,25 @@ pub async fn accept(
         .guard_transaction(&mut tx, community)
         .await
         .map_err(|_| IngestError::Rejected("restricted: community writes are fenced".into()))?;
-    let inserted = buzz_db::assigned_bot::apply_in_transaction(&mut tx, &command)
-        .await
-        .map_err(|error| match error {
-            buzz_db::DbError::AccessDenied(reason) | buzz_db::DbError::InvalidData(reason) => {
-                IngestError::Rejected(format!("restricted: {reason}"))
-            }
-            buzz_db::DbError::ChannelNotFound(_) => {
-                IngestError::Rejected("invalid: assigned channel not found".into())
-            }
-            _ => IngestError::Internal("error: assigned bot persistence failed".into()),
-        })?;
+    let inspection = matches!(command.operation(), AssignedBotOperation::Inspect { .. });
+    let (inserted, observation) = if inspection {
+        buzz_db::assigned_bot::inspect_in_transaction(&mut tx, &command)
+            .await
+            .map(|value| (true, Some(value)))
+    } else {
+        buzz_db::assigned_bot::apply_in_transaction(&mut tx, &command)
+            .await
+            .map(|inserted| (inserted, None))
+    }
+    .map_err(|error| match error {
+        buzz_db::DbError::AccessDenied(reason) | buzz_db::DbError::InvalidData(reason) => {
+            IngestError::Rejected(format!("restricted: {reason}"))
+        }
+        buzz_db::DbError::ChannelNotFound(_) => {
+            IngestError::Rejected("invalid: assigned channel not found".into())
+        }
+        _ => IngestError::Internal("error: assigned bot persistence failed".into()),
+    })?;
     tx.commit()
         .await
         .map_err(|_| IngestError::Internal("error: commit assigned bot command".into()))?;
@@ -85,7 +93,11 @@ pub async fn accept(
         IngestResult {
             event_id: command.event_id().to_hex(),
             accepted: true,
-            message: if inserted {
+            message: if let Some(observation) = observation {
+                serde_json::to_string(&observation).map_err(|_| {
+                    IngestError::Internal("error: serialize assignment observation".into())
+                })?
+            } else if inserted {
                 String::new()
             } else {
                 "duplicate:".into()

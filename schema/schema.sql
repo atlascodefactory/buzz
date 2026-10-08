@@ -208,6 +208,17 @@ CREATE TABLE assigned_bots (
     UNIQUE (community_id, assignment_id),
     CHECK (bot_pubkey <> owner_pubkey AND bot_pubkey <> authority_pubkey AND owner_pubkey <> authority_pubkey)
 );
+-- Private, expiring single-use inspection nonces, including missing assignments.
+-- Deliberately independent of assigned_bots: inspection never bootstraps a bot.
+CREATE TABLE assigned_bot_inspections (
+    community_id UUID NOT NULL REFERENCES communities(id),
+    authority_pubkey BYTEA NOT NULL CHECK (length(authority_pubkey) = 32),
+    nonce UUID NOT NULL CHECK (nonce <> '00000000-0000-0000-0000-000000000000'::uuid),
+    expires_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (community_id, authority_pubkey, nonce)
+);
+CREATE INDEX assigned_bot_inspections_expiry ON assigned_bot_inspections (community_id, authority_pubkey, expires_at);
+
 CREATE TABLE assigned_bot_commands (
     community_id UUID NOT NULL,
     bot_pubkey BYTEA NOT NULL,
@@ -1951,6 +1962,7 @@ SELECT attach_community_write_fence('api_tokens');
 SELECT attach_community_write_fence('archived_identities');
 SELECT attach_community_write_fence('assigned_bots');
 SELECT attach_community_write_fence('assigned_bot_commands');
+SELECT attach_community_write_fence('assigned_bot_inspections');
 SELECT attach_community_write_fence('audit_log');
 SELECT attach_community_write_fence('channel_members');
 SELECT attach_community_write_fence('channels');

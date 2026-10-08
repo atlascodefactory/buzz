@@ -11,6 +11,10 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::{DbError, Result};
 
+#[path = "assigned_bot_inspection.rs"]
+mod inspection;
+pub use inspection::inspect_in_transaction;
+
 /// Apply a verified command and retain its nonce atomically with its effects.
 ///
 /// Lock order is bot lifecycle, then channel membership/TTL/row (for admission).
@@ -23,6 +27,11 @@ pub async fn apply_in_transaction(
     tx: &mut Transaction<'_, Postgres>,
     command: &AssignedBotCommand,
 ) -> Result<bool> {
+    if matches!(command.operation(), AssignedBotOperation::Inspect { .. }) {
+        return Err(DbError::InvalidData(
+            "inspection cannot mutate an assignment".into(),
+        ));
+    }
     let community = *command.community().as_uuid();
     let bot = command.bot().to_bytes();
     let owner = command.owner().to_bytes();
@@ -84,6 +93,11 @@ pub async fn apply_in_transaction(
     }
     require_current_lifetime(tx, command).await?;
     match command.operation() {
+        AssignedBotOperation::Inspect { .. } => {
+            return Err(DbError::InvalidData(
+                "inspection cannot mutate an assignment".into(),
+            ));
+        }
         AssignedBotOperation::Admit { .. } => {
             if !crate::channel_members::admit_assigned_bot_in_transaction(tx, command).await? {
                 return Err(DbError::AccessDenied(

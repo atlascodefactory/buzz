@@ -559,7 +559,8 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         KIND_NIP29_PUT_USER | KIND_NIP29_REMOVE_USER | KIND_NIP29_DELETE_GROUP
         | buzz_core::kind::KIND_CONDITIONAL_BOT_ADMISSION
         | buzz_core::kind::KIND_ASSIGNED_BOT_ADMISSION
-        | buzz_core::kind::KIND_ASSIGNED_BOT_REVOCATION => {
+        | buzz_core::kind::KIND_ASSIGNED_BOT_REVOCATION
+        | buzz_core::kind::KIND_ASSIGNED_BOT_INSPECTION => {
             Ok(Scope::AdminChannels)
         }
         // NIP-43: relay membership admin commands (9030–9032) + Buzz
@@ -2573,12 +2574,17 @@ async fn ingest_event_inner(
         kind_u32,
         buzz_core::kind::KIND_ASSIGNED_BOT_ADMISSION
             | buzz_core::kind::KIND_ASSIGNED_BOT_REVOCATION
+            | buzz_core::kind::KIND_ASSIGNED_BOT_INSPECTION
     ) {
         let claimed = claimed_community_from_event(&event);
         let msg_id = msg_id_label(event.id.as_bytes());
         let (result, channel) =
             super::assigned_bot::accept(tenant, state, event, *auth.pubkey(), auth.channel_ids())
                 .await?;
+        if kind_u32 == buzz_core::kind::KIND_ASSIGNED_BOT_INSPECTION {
+            // A private nonce receipt is not a published/global event.
+            return Ok(result);
+        }
         if let Some(channel) = channel {
             let action = if result.message == "duplicate:" {
                 TraceAction::WriteDuplicate {

@@ -10,6 +10,9 @@ mod phantom_postgres_tests;
 #[path = "assigned_bot_gift_wrap_postgres_tests.rs"]
 mod gift_wrap_postgres_tests;
 
+#[path = "assigned_bot_inspection_postgres_tests.rs"]
+mod inspection_postgres_tests;
+
 struct Fixture {
     pool: PgPool,
     community: CommunityId,
@@ -89,7 +92,9 @@ impl Fixture {
             generation,
             nonce,
             &self.owner,
-            Timestamp::now().as_secs(),
+            // Test client and Docker's DB clock can straddle a second boundary.
+            // Keep positive fixtures in the past; boundary tests use command_at.
+            Timestamp::now().as_secs().saturating_sub(1),
             60,
         )
     }

@@ -39,6 +39,13 @@ pub enum AssignedBotOperation {
     },
     /// Permanently withdraw this assignment generation, not a channel role.
     Revoke,
+    /// Inspect one exact assignment and a bounded page of the owner's channels.
+    Inspect {
+        /// Exclusive channel UUID cursor, never an alternate owner or tenant.
+        cursor: Option<Uuid>,
+        /// Optional exact admission/revocation receipt to reconcile a lost ACK.
+        receipt: Option<EventId>,
+    },
 }
 
 /// Verified immutable coordinates; construction requires real signature checks.
@@ -141,12 +148,40 @@ impl AssignedBotCommand {
             return Err(AssignmentCommandError::AuthorityMismatch);
         }
         verify_event(event).map_err(|_| AssignmentCommandError::Signature)?;
-        let admission = match crate::kind::event_kind_u32(event) {
+        let event_kind = crate::kind::event_kind_u32(event);
+        let admission = match event_kind {
             kind::KIND_ASSIGNED_BOT_ADMISSION => true,
-            kind::KIND_ASSIGNED_BOT_REVOCATION => false,
+            kind::KIND_ASSIGNED_BOT_REVOCATION | kind::KIND_ASSIGNED_BOT_INSPECTION => false,
             _ => return Err(AssignmentCommandError::Envelope),
         };
-        if !event.content.is_empty() || event.tags.len() != if admission { 10 } else { 7 } {
+        let inspection = event_kind == kind::KIND_ASSIGNED_BOT_INSPECTION;
+        let optional_tag = |name: &str| {
+            if event
+                .tags
+                .iter()
+                .any(|t| t.as_slice().first().is_some_and(|key| key == name))
+            {
+                tag(event, name).map(Some)
+            } else {
+                Ok(None)
+            }
+        };
+        let cursor = if inspection {
+            optional_tag("cursor")?
+        } else {
+            None
+        };
+        let receipt = if inspection {
+            optional_tag("receipt")?
+        } else {
+            None
+        };
+        let expected_tags = if admission {
+            10
+        } else {
+            7 + usize::from(cursor.is_some()) + usize::from(receipt.is_some())
+        };
+        if !event.content.is_empty() || event.tags.len() != expected_tags {
             return Err(AssignmentCommandError::Envelope);
         }
         if tag(event, "community")? != community.to_string() {
@@ -185,6 +220,23 @@ impl AssignedBotCommand {
             AssignedBotOperation::Admit {
                 channel_id,
                 expected_role,
+            }
+        } else if inspection {
+            let receipt = receipt
+                .map(|value| {
+                    if value.len() != 64
+                        || !value
+                            .bytes()
+                            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                    {
+                        return Err(AssignmentCommandError::Envelope);
+                    }
+                    EventId::from_hex(value).map_err(|_| AssignmentCommandError::Envelope)
+                })
+                .transpose()?;
+            AssignedBotOperation::Inspect {
+                cursor: cursor.map(uuid).transpose()?,
+                receipt,
             }
         } else {
             AssignedBotOperation::Revoke

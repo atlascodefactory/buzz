@@ -11,6 +11,92 @@ use sha2::{Digest, Sha256};
 #[path = "assigned_bot_gift_wrap_postgres_tests.rs"]
 mod gift_wrap_postgres_tests;
 
+fn inspection_request(f: &Fixture) -> Event {
+    let base = f.request(&f.authority, true, f.tenant.community().to_string());
+    EventBuilder::new(
+        Kind::Custom(buzz_core::kind::KIND_ASSIGNED_BOT_INSPECTION as u16),
+        "",
+    )
+    .custom_created_at(base.created_at)
+    .tags(base.tags.iter().cloned())
+    .sign_with_keys(&f.authority)
+    .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn inspection_ingress_requires_pin_scope_and_unrestricted_token() {
+    let f = Fixture::new(ChannelVisibility::Private, true).await;
+    for auth in [
+        f.ws(Scope::MessagesWrite, None),
+        f.ws(Scope::AdminChannels, Some(vec![f.channel])),
+    ] {
+        assert!(
+            ingest_event(&f.state, &f.tenant, inspection_request(&f), auth)
+                .await
+                .is_err()
+        );
+    }
+    let unpinned = Fixture::new(ChannelVisibility::Private, false).await;
+    assert!(ingest_event(
+        &unpinned.state,
+        &unpinned.tenant,
+        inspection_request(&unpinned),
+        unpinned.http()
+    )
+    .await
+    .is_err());
+    let foreign = IngestAuth::Http {
+        pubkey: f.owner.public_key(),
+        scopes: vec![Scope::AdminChannels],
+        auth_method: HttpAuthMethod::Nip98,
+    };
+    assert!(
+        ingest_event(&f.state, &f.tenant, inspection_request(&f), foreign)
+            .await
+            .is_err()
+    );
+    let event = inspection_request(&f);
+    let result = ingest_event(
+        &f.state,
+        &f.tenant,
+        event.clone(),
+        f.ws(Scope::AdminChannels, None),
+    )
+    .await
+    .unwrap();
+    let observation: serde_json::Value = serde_json::from_str(&result.message).unwrap();
+    assert_eq!(observation["assignmentState"], "missing");
+    assert_eq!(
+        observation["channels"][0]["channelId"],
+        f.channel.to_string()
+    );
+    f.no_effect(&event).await;
+    assert!(
+        ingest_event(&f.state, &f.tenant, event, f.ws(Scope::AdminChannels, None))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn inspection_real_http_ack_returns_private_observation_not_a_public_event() {
+    let f = Fixture::new(ChannelVisibility::Private, true).await;
+    let server = LocalHttpRelay::new(f.state.clone()).await;
+    let event = inspection_request(&f);
+    let (status, body) = server.event(&f, &f.authority, &event).await;
+    assert!(status.is_success(), "{body}");
+    assert_eq!(body["accepted"], true, "{body}");
+    let observation: serde_json::Value =
+        serde_json::from_str(body["message"].as_str().unwrap()).unwrap();
+    assert_eq!(observation["assignmentState"], "missing");
+    assert_eq!(observation["botPublicKey"], f.bot.public_key().to_hex());
+    f.no_effect(&event).await;
+    let (_, replay) = server.event(&f, &f.authority, &event).await;
+    assert_ne!(replay["accepted"], true, "{replay}");
+}
+
 struct Fixture {
     state: Arc<AppState>,
     tenant: TenantContext,
@@ -118,7 +204,8 @@ impl Fixture {
     }
 
     fn request(&self, signer: &Keys, revoke: bool, claimed: String) -> Event {
-        let now = Timestamp::now().as_secs();
+        // Avoid cross-clock second-boundary flakes in positive signed fixtures.
+        let now = Timestamp::now().as_secs().saturating_sub(1);
         let mut tags = vec![
             vec!["community".into(), claimed],
             vec!["owner".into(), self.owner.public_key().to_hex()],

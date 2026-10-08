@@ -11,6 +11,104 @@ struct Fixture {
     nonce: Uuid,
 }
 
+#[test]
+fn inspection_binds_optional_cursor_and_receipt_without_admission_tags() {
+    let f = Fixture::new();
+    let receipt = f.event(true).id;
+    for cursor in [None, Some(f.channel)] {
+        for receipt in [None, Some(receipt)] {
+            let mut tags = f.tags(false);
+            if let Some(cursor) = cursor {
+                tags.push(vec!["cursor".into(), cursor.to_string()]);
+            }
+            if let Some(receipt) = receipt {
+                tags.push(vec!["receipt".into(), receipt.to_hex()]);
+            }
+            let event = f.signed(kind::KIND_ASSIGNED_BOT_INSPECTION, tags, "");
+            assert_eq!(
+                f.verify(&event, 1000).unwrap().operation(),
+                AssignedBotOperation::Inspect { cursor, receipt }
+            );
+        }
+    }
+}
+
+#[test]
+fn inspection_rejects_ambiguous_unknown_or_noncanonical_fields() {
+    let f = Fixture::new();
+    for extra in [
+        vec![vec!["cursor".into(), Uuid::nil().to_string()]],
+        vec![vec!["receipt".into(), "A".repeat(64)]],
+        vec![vec!["receipt".into(), "00".into()]],
+        vec![
+            vec!["cursor".into(), f.channel.to_string()],
+            vec!["cursor".into(), f.channel.to_string()],
+        ],
+        vec![
+            vec!["receipt".into(), "a".repeat(64)],
+            vec!["receipt".into(), "b".repeat(64)],
+        ],
+        vec![vec!["h".into(), f.channel.to_string()]],
+        vec![vec!["cursor".into(), f.channel.to_string(), "extra".into()]],
+    ] {
+        let mut tags = f.tags(false);
+        tags.extend(extra);
+        assert!(f
+            .verify(
+                &f.signed(kind::KIND_ASSIGNED_BOT_INSPECTION, tags, ""),
+                1000
+            )
+            .is_err());
+    }
+    let good = f.tags(false);
+    for index in 0..good.len() {
+        let mut tags = good.clone();
+        tags.remove(index);
+        assert!(f
+            .verify(
+                &f.signed(kind::KIND_ASSIGNED_BOT_INSPECTION, tags, ""),
+                1000
+            )
+            .is_err());
+    }
+}
+
+#[test]
+fn inspection_requires_current_lifetime_actual_signature_and_pinned_actor() {
+    let f = Fixture::new();
+    let event = f.signed(kind::KIND_ASSIGNED_BOT_INSPECTION, f.tags(false), "");
+    for now in [999, 1060, 1061] {
+        assert!(f.verify(&event, now).is_err());
+    }
+    assert!(AssignedBotCommand::verify(
+        &event,
+        f.community,
+        &f.owner.public_key(),
+        Some(&f.authority.public_key()),
+        1000
+    )
+    .is_err());
+    assert!(
+        AssignedBotCommand::verify(&event, f.community, &f.authority.public_key(), None, 1000)
+            .is_err()
+    );
+    assert!(AssignedBotCommand::verify(
+        &event,
+        CommunityId::from_uuid(Uuid::new_v4()),
+        &f.authority.public_key(),
+        Some(&f.authority.public_key()),
+        1000
+    )
+    .is_err());
+    let mut tampered: serde_json::Value = serde_json::from_str(&event.as_json()).unwrap();
+    tampered["sig"] = serde_json::Value::String("0".repeat(128));
+    assert_eq!(
+        f.verify(&Event::from_json(tampered.to_string()).unwrap(), 1000)
+            .unwrap_err(),
+        AssignmentCommandError::Signature
+    );
+}
+
 impl Fixture {
     fn new() -> Self {
         Self {
