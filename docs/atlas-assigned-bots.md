@@ -170,9 +170,22 @@ host/VM second-boundary flake; production lifetime checks were not relaxed.
 Local runner limitation: `cargo-nextest` is absent, so these tests used ordinary
 Cargo and task-owned isolated PostgreSQL/Redis containers, not existing user or
 production databases. Docker's data disk was full; PostgreSQL used bounded
-temporary memory, without deleting unrelated Docker data. Full `just ci` is
-still pending at this checkpoint. These results do not establish official-client
-compatibility, production deployment or completion of the Atlas receiver.
+temporary memory, without deleting unrelated Docker data.
+
+Subsequent verification: the original full `just ci` found three audio failures;
+the cancellation fix and corrected dependency-seam tests now pass all 40
+infra-free audio cases. A second run exposed an unchanged global-pool-metrics
+test interference under parallel Cargo execution. `RUST_TEST_THREADS=1 just ci`
+passed every Rust and desktop/web stage, including 3,419 native desktop tests,
+but exited 1 at Mobile after a 30-second push-export timeout and a follow-on
+failure. The unchanged 18-case push-export file passed in isolation; then the
+entire Mobile suite passed with `--concurrency=2`: 2,654 passed, four skipped,
+zero failures. Assertions, timeouts and CI configuration were not weakened.
+This is passing per-stage/rerun evidence, not an exit-0 claim for one complete
+default `just ci` invocation. The shared-service `just test` harness was not run
+against existing user databases; the isolated DB/Relay evidence above is narrower
+than the complete PostgreSQL integration lane. These results do not establish
+official-client compatibility, production deployment or a complete Atlas receiver.
 
 Atlas still needs a verified-link lifecycle producer using the configured signing
 authority and current tenant/user/bot generation, reconciliation and revocation.
