@@ -73,6 +73,14 @@ shared development or production database.
 
 ## Remaining release checks
 
-Full repository CI, human test confirmation or an explicit applicable waiver,
-and exact-head merge approval remain.
+Full local repository `just ci` completed successfully (session23081, exit0,
+10Oct2026) at source adc0e117b8f31b52f52709bc30f4cab0b59b8f8b. Static checks,
+Rust unit lanes, desktop JS6784 tests, admin JS139 tests, desktop build/Tauri
+checks, Tauri Rust3419 tests (19 existing ignored), and Mobile lanes passed.
+Existing opt-in/infrastructure skips are not claimed as executed by this lane;
+the added real PostgreSQL regression and real WebSocket proof ran separately
+as documented above. This is local CI evidence, not hosted checks or deployment.
+
+Human test confirmation or an explicit applicable waiver, hosted checks and
+exact-head merge approval remain.
 No merge or deployment is implied by this local regression evidence.
