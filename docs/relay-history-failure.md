@@ -37,6 +37,29 @@ itself guarantee delivery of arbitrary late/backdated events.
   followed by CLOSED, even with a queued EOSE afterwards. Its full Bridge suite
   passed477 tests with nine existing opt-in skips. This is client-side evidence,
   not proof of a deployed Relay.
+- A built `buzz-relay` process was also exercised over its actual WebSocket
+  endpoint with fresh PostgreSQL16/Redis7 fixtures and synthetic NIP-42 keys.
+  A signed kind9 event was seeded directly into the owned database (event
+  publishing is not part of this proof). An ordinary runtime DB role first
+  returned that event plus EOSE; revoking its SELECT on `events` then produced
+  exactly generic CLOSED, no EVENT/EOSE for the failed subscription. After
+  restoring SELECT, a new REQ on the same authenticated connection returned
+  the original event plus EOSE. Owned process and containers were removed
+  before success was emitted. This tests a real database permission failure,
+  not simulated WebSocket responses; it is not an official-client test.
+  Git/media object-store probes were disabled only in this isolated fixture;
+  those unrelated features and deployment configuration are not validated.
+
+## Scoped agent review
+
+Main-agent review, not an independent review: history failures now propagate
+through the existing owner-fenced retirement path, after releasing the request
+permit. Statement-timeout behavior is unchanged; a replacement subscription is
+not closed by an old request. The new test binds the production handler and is
+falsifiable by restoring the old EOSE branch. No new authority or resource loop
+is introduced. No blocking defect found in this bounded change. Minimalism,
+correctness and clarity meet the scoped review bar; this does not approve the
+larger Atlas receiver or establish lossless late-event recovery.
 
 Run the database test with the repository's isolated PostgreSQL lane:
 
@@ -50,6 +73,6 @@ shared development or production database.
 
 ## Remaining release checks
 
-Full repository CI, a real Relay WebSocket workflow, human test confirmation
-or an explicit applicable waiver, review and exact-head merge approval remain.
+Full repository CI, human test confirmation or an explicit applicable waiver,
+and exact-head merge approval remain.
 No merge or deployment is implied by this local regression evidence.
