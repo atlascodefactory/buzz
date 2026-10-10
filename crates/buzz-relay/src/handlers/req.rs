@@ -397,7 +397,7 @@ pub async fn handle_req(
     // Registration above is one uncancellable unit; the history read below is
     // read-only delivery and races gate cancellation, so expiry drops it and
     // releases the permit without sending another EVENT or EOSE. It returns
-    // whether a statement timeout ended it: retirement then runs after the
+    // whether a database failure ended it: retirement then runs after the
     // race, because a dropped retirement would leak its unreleased topics.
     let history = async {
         #[cfg(test)]
@@ -477,10 +477,13 @@ pub async fn handle_req(
                 Err(e) => {
                     warn!(conn_id = %conn_id, sub_id = %sub_id, "Historical query failed: {e}");
                     if e.is_statement_cancelled() {
-                        return true;
+                        return Err(QUERY_TIMED_OUT_CLOSED);
                     }
-                    conn.send(RelayMessage::eose(&sub_id));
-                    return false;
+                    // EOSE is a successful history boundary. Returning it on
+                    // failure makes catch-up clients acknowledge unread data.
+                    // Retire this owner outside the cancellation race, keeping
+                    // database details server-side, just as for timeouts.
+                    return Err("error: database error");
                 }
             };
 
@@ -557,7 +560,7 @@ pub async fn handle_req(
 
                 let msg = RelayMessage::event(&sub_id, &stored.event);
                 if !conn.send(msg) {
-                    return false;
+                    return Ok(());
                 }
                 total_sent += 1;
                 if total_sent.is_multiple_of(100) {
@@ -574,13 +577,15 @@ pub async fn handle_req(
             count = total_sent,
             "EOSE sent after historical delivery"
         );
-        false
+        Ok(())
     };
     let outcome = unless_cancelled(&conn, history).await;
     drop(_req_permit);
     match outcome {
-        Some(false) => {}
-        Some(true) => close_timed_out_subscription(&sub_id, owner, &conn, &state).await,
+        Some(Ok(())) => {}
+        Some(Err(reason)) => {
+            super::close::close_if_owner(&sub_id, owner, Some(reason), &conn, &state).await;
+        }
         None => {
             super::close::close_if_owner(&sub_id, owner, None, &conn, &state).await;
         }
@@ -1767,6 +1772,10 @@ pub(crate) fn author_only_filters_authorized(filters: &[Filter], authed_pubkey_h
         })
     })
 }
+
+#[cfg(test)]
+#[path = "req_history_failure_tests.rs"]
+mod history_failure_postgres_tests;
 
 #[cfg(test)]
 mod tests {
