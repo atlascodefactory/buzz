@@ -81,6 +81,10 @@ Existing opt-in/infrastructure skips are not claimed as executed by this lane;
 the added real PostgreSQL regression and real WebSocket proof ran separately
 as documented above. This is local CI evidence, not hosted checks or deployment.
 
-Human test confirmation or an explicit applicable waiver, hosted checks and
-exact-head merge approval remain.
+On10October2026 Michael explicitly waived his personal Relay test for this
+history-failure patch in the Lenny/Buzz task. The agent-run regression and CI
+above are not represented as human testing; the checklist-attestation marker
+is deliberately not asserted. This waiver does not cover hosted checks,
+exact-head merge approval, deployment or official-client acceptance.
+Hosted checks and exact-head merge approval remain.
 No merge or deployment is implied by this local regression evidence.
