@@ -73,6 +73,17 @@ shared development or production database.
 
 ## Remaining release checks
 
+Independent read-only source review10Oct2026 by Codex verifier
+review_receive_expiry compared61b016157 to574a4acf2 and found no concrete blocker.
+It traced the production error branch, permit/cancellation ordering and
+close_if_owner's shared lifecycle lock, including the terminal frame and stale
+replacement fence. Minimalism, correctness and clarity each met9/10 for this
+bounded patch. The reviewer did not rerun tests; search REQs, official clients
+and production activation were outside its review. Fresh main-agent rerun:
+format PASS, targeted handler suite65PASS/6Postgres cases ignored in the unit
+lane. The separate actual PostgreSQL/socket/mutation evidence above remains
+distinct. No source behavior changed after the documented full local CI run.
+
 Full local repository `just ci` completed successfully (session23081, exit0,
 10Oct2026) at source adc0e117b8f31b52f52709bc30f4cab0b59b8f8b. Static checks,
 Rust unit lanes, desktop JS6784 tests, admin JS139 tests, desktop build/Tauri
