@@ -354,8 +354,9 @@ fn p0_pool_acquisitions_use_typed_operation_pairs_without_other() {
         .expect("restriction state must precede full ban reads")
         .0;
     assert!(restriction_state.contains("WriterOperation::Authorization"));
-    assert!(restriction_state.contains("fetch_optional(&mut *connection)"));
+    assert!(restriction_state.contains("fetch_one(&mut *connection)"));
     assert!(!restriction_state.contains("fetch_optional(pool)"));
+    assert!(!restriction_state.contains("fetch_one(pool)"));
 
     let community_store = include_str!("../src/store/community.rs");
     let ensure_community = community_store
@@ -524,26 +525,40 @@ fn p0_pool_acquisitions_use_typed_operation_pairs_without_other() {
         .0;
     assert!(lease_stats.contains("WriterOperation::Maintenance"));
     assert!(lease_stats.contains("fetch_one(&mut *connection)"));
-    for (start, end) in [
+    let bounded_lease_sql = deletion
+        .split_once("async fn bounded_serving_lease_sql<T>(")
+        .expect("serving leases must expose their bounded acquisition helper")
+        .1
+        .split_once("/// Acquire a durable, expiring lease")
+        .expect("bounded acquisition must precede lease admission")
+        .0;
+    assert!(bounded_lease_sql.contains("acquire_writer_until("));
+    assert!(bounded_lease_sql.contains("WriterOperation::EventWrite"));
+    for (start, end, acquisition) in [
         (
             "pub async fn acquire_serving_write_lease",
             "/// Renew an already-admitted external side-effect lease",
+            "self.bounded_serving_lease_sql(SERVING_WRITE_LEASE_SQL_TIMEOUT,",
         ),
         (
             "pub async fn renew_serving_write_lease",
             "/// Release a serving side-effect lease",
+            "WriterOperation::EventWrite",
         ),
         (
             "pub async fn release_serving_write_lease",
             "/// Check that an external side-effect lease remains current",
+            "self.bounded_serving_lease_sql(SERVING_WRITE_LEASE_SQL_TIMEOUT,",
         ),
         (
             "pub async fn verify_serving_write_lease",
             "/// Delete expired serving leases",
+            "self.bounded_serving_lease_sql(SERVING_WRITE_LEASE_SQL_TIMEOUT,",
         ),
         (
             "pub async fn is_serving_active",
             "async fn advance_with_checkpoint",
+            "WriterOperation::EventWrite",
         ),
     ] {
         let function = deletion
@@ -554,7 +569,7 @@ fn p0_pool_acquisitions_use_typed_operation_pairs_without_other() {
             .unwrap_or_else(|| panic!("serving-write seam {start} must precede {end}"))
             .0;
         assert!(
-            function.contains("WriterOperation::EventWrite"),
+            function.contains(acquisition),
             "serving-write seam {start} must be event-write attributed"
         );
         assert!(!function.contains("self.pool.begin().await"));

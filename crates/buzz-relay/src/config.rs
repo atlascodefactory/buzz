@@ -7,6 +7,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{error, warn};
 
+mod git_storage;
+pub use git_storage::GitStorageConfig;
+
 /// Default maximum inbound WebSocket frame size in bytes.
 ///
 /// Must comfortably exceed accepted event content sizes after Nostr JSON and
@@ -302,6 +305,8 @@ pub struct Config {
 
     /// Media storage configuration (S3/MinIO).
     pub media: buzz_media::MediaConfig,
+    /// Independent Git S3 settings; absent means use the current media settings.
+    pub git_storage: Option<GitStorageConfig>,
     /// Maximum concurrent media uploads handled by one relay process.
     pub media_max_concurrent_uploads: usize,
     /// Maximum concurrent media uploads accepted from one pubkey.
@@ -609,6 +614,13 @@ fn inert_env_vars<'a>(names: &[&'a str], lookup: impl Fn(&str) -> Option<String>
 }
 
 impl Config {
+    /// Resolve Git independently while preserving the shared-backend default.
+    pub(crate) fn resolved_git_storage(&self) -> GitStorageConfig {
+        self.git_storage
+            .clone()
+            .unwrap_or_else(|| GitStorageConfig::from_media(&self.media))
+    }
+
     /// Loads configuration from environment variables, falling back to development defaults.
     pub fn from_env() -> Result<Self, ConfigError> {
         let bind_addr_raw =
@@ -923,6 +935,8 @@ impl Config {
         );
         let partition_manager_create_enabled =
             parse_bool("BUZZ_PARTITION_MANAGER_CREATE_ENABLED", true)?;
+
+        let git_storage = GitStorageConfig::from_env()?;
 
         let s3_addressing_style = match std::env::var("BUZZ_S3_ADDRESSING_STYLE") {
             Ok(value) => value.parse().map_err(ConfigError::InvalidValue)?,
@@ -1381,6 +1395,7 @@ impl Config {
             allow_nip_oa_auth,
             klipy,
             media,
+            git_storage,
             media_max_concurrent_uploads,
             media_max_concurrent_uploads_per_pubkey,
             media_uploads_per_minute,

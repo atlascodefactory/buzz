@@ -1,5 +1,9 @@
 [advisories]
 ignore = [
+    # Michael approved this existing maintenance-only exception on 2026-10-15
+    # for the Relay media/Git storage split. serde_yaml also arrives via kube;
+    # unsafe-libyaml has no patched release. Do not suppress TLS vulnerabilities.
+    { id = "RUSTSEC-2024-0449", reason = "explicit owner approval 2026-10-15: existing serde_yaml/kube dependency is unmaintained with no patched release; tracked replacement remains required" },
     # instant 0.1.13 — unmaintained crate. Transitive dep: nostr → instant.
     # Will be resolved when nostr crate updates its dependencies.
     { id = "RUSTSEC-2024-0384", reason = "transitive dep via nostr; no upstream fix available" },
