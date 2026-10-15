@@ -439,7 +439,7 @@ test-unit:
         cargo nextest run -p buzz-agent
         # The assignment-authority pin is a fail-closed startup boundary.
         # Keep its infra-free parser regression in the required unit lane.
-        cargo nextest run -p buzz-relay --lib -E 'test(/^assigned_bot_config::tests::/)'
+        cargo nextest run -p buzz-relay --lib -E 'test(/^assigned_bot_config::tests::/) + test(/^config::git_storage::tests::/)'
         # Admin API auth-boundary tests (api::admin in buzz-relay): the NIP-98
         # duplicate-tag rejections, the Host/Origin replay-ordering causal pair,
         # the admin.localhost origin/advertisement/canonical-URL pins, and the
