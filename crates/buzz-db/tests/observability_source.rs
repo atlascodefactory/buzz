@@ -354,8 +354,9 @@ fn p0_pool_acquisitions_use_typed_operation_pairs_without_other() {
         .expect("restriction state must precede full ban reads")
         .0;
     assert!(restriction_state.contains("WriterOperation::Authorization"));
-    assert!(restriction_state.contains("fetch_optional(&mut *connection)"));
+    assert!(restriction_state.contains("fetch_one(&mut *connection)"));
     assert!(!restriction_state.contains("fetch_optional(pool)"));
+    assert!(!restriction_state.contains("fetch_one(pool)"));
 
     let community_store = include_str!("../src/store/community.rs");
     let ensure_community = community_store
