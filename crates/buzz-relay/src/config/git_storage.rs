@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn resolved_git_config_follows_media_only_without_override() {
-        let mut config = super::super::Config::test_default();
+        let mut config = super::super::Config::for_test();
         config.git_storage = None;
         config.media.s3_endpoint = "https://media.example.invalid".into();
         config.media.s3_bucket = "media-only".into();
