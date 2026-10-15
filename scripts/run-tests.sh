@@ -165,6 +165,9 @@ run_unit_tests() {
     cargo test -p buzz-acp --lib -- --nocapture
 
   # Mirror the required nextest lane for the fail-closed assignment pin.
+  run_test_step "buzz-relay independent Git storage config tests" \
+    cargo test -p buzz-relay --lib config::git_storage::tests:: -- --nocapture
+
   run_test_step "buzz-relay assigned-bot authority config tests" \
     cargo test -p buzz-relay --lib assigned_bot_config::tests:: -- --nocapture
 
