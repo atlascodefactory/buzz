@@ -22,3 +22,11 @@ The focused configuration tests cover default compatibility, every partial
 combination, complete overrides, invalid endpoint/style values, redacted debug
 output and the actual Config resolver consumed by AppState. Runtime acceptance
 must independently verify media transfer and the Git CAS startup probe.
+
+Release dependency note (2026-10-15): rustls is patched to 0.23.46 in both Rust
+lockfiles. Michael explicitly approved the narrowly scoped maintenance advisory
+exception RUSTSEC-2024-0449 for the existing unsafe-libyaml dependency, which has
+no patched release and is also pulled through kube. Replacing that YAML stack
+remains follow-up work; no TLS vulnerability advisory was suppressed. Michael
+also explicitly waived the extra human manual test for this storage-only task;
+automated runtime acceptance and all other release gates remain required.
