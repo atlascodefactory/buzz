@@ -13,6 +13,7 @@
 //! | `BUZZ_NIP_FI_ISSUERS` | If enforce | JSON array of issuer configs (see [`IssuerEnvConfig`]). |
 //! | `BUZZ_NIP_FI_COMMUNITIES` | If enforce | JSON array mapping each community's canonical URI to its authorized issuers (see [`CommunityEnvConfig`]). |
 //! | `BUZZ_NIP_FI_MAX_CONNECTION_LIFETIME_SECS` | If enforce | Per-partition limit on session lifetime. |
+//! | `BUZZ_NIP_FI_PROVISION_BINDING` | No | JSON `{"host_suffix", "authorized_issuers"}` binding communities created one label under the suffix; read in every mode (see [`buzz_auth::ProvisionBindingPolicy`]). |
 //!
 //! Each `BUZZ_NIP_FI_ISSUERS` entry also carries the S4 command-API fields.
 //! Enforce-mode startup fails if any issuer lacks the required ones:
@@ -33,6 +34,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use buzz_auth::nip_fi::provision::canonical_authority;
 use buzz_auth::{
     validate_nip_fi_config, CommunityBinding, FreshnessClass, IssuerJwksConfig, IssuerPolicy,
     IssuerPolicyError, IssuerRegistry, JwksSourceContract, NipFiMode, NipFiStartupError,
@@ -61,12 +63,30 @@ const MAX_CONNECTION_LIFETIME_SECS: u64 = 30 * 24 * 3600;
 ///     "skew_seconds": 30,
 ///     "maximum_assertion_age_seconds": 3600,
 ///     "jwks_uri": "https://login.example.com/.well-known/jwks.json",
+///     "jwks_transport": "public_https",
 ///     "jwks_refresh_interval_seconds": 300,
 ///     "jwks_hard_deadline_seconds": 86400,
 ///     "maximum_command_age_seconds": 30,
 ///     "authorized_principals": ["admin-svc@login.example.com"]
 ///   }
 /// ]
+/// ```
+/// `jwks_transport` is optional and defaults to `public_https`. The `mesh`
+/// form requires an HTTP URI with a DNS hostname (not an IP literal) and no
+/// userinfo, query, fragment, or backslash. Every DNS answer is checked
+/// against the positive address allow-list in the
+/// [NIP-FI JWKS snapshot contract](../../../docs/nips/NIP-FI.md#jwks-snapshot);
+/// empty or mixed answers deny, and the first checked address is pinned.
+/// Selecting `mesh` is an operator assertion: the deployment must enforce
+/// mutual TLS peer authentication and integrity protection, authorize the
+/// JWKS endpoint, and restrict egress. The relay cannot verify those
+/// properties, and unauthenticated HTTP permits key substitution and issuer
+/// impersonation.
+///
+/// For example:
+/// ```json
+/// { "jwks_uri": "http://mesh.example.test/.well-known/jwks.json",
+///   "jwks_transport": "mesh" }
 /// ```
 /// The `require_attested_key` field is not part of this schema; S2 removed it
 /// from buzz-auth. S3 enforces key pairing structurally for every issuer.
@@ -90,8 +110,13 @@ pub(super) struct IssuerEnvConfig {
     pub skew_seconds: u64,
     /// `iat + maximum_assertion_age` residual bound in seconds.
     pub maximum_assertion_age_seconds: u64,
-    /// HTTPS endpoint serving the JWK Set for this issuer.
+    /// JWK Set endpoint for this issuer; HTTPS by default, or HTTP with the
+    /// explicitly selected mesh transport and its
+    /// [NIP-FI address allow-list](../../../docs/nips/NIP-FI.md#jwks-snapshot).
     pub jwks_uri: String,
+    /// Per-issuer JWKS transport. Unknown values are rejected during parsing.
+    #[serde(default)]
+    pub jwks_transport: JwksTransportEnvConfig,
     /// Seconds between JWKS refreshes.
     pub jwks_refresh_interval_seconds: u64,
     /// Hard deadline for accepting a JWKS snapshot in seconds.
@@ -120,6 +145,18 @@ pub(super) enum TokenClassEnvConfig {
     DedicatedNipFi,
     #[serde(rename = "at+jwt")]
     AccessTokenAtJwt,
+}
+
+/// Transport selected for one issuer's JWKS endpoint.
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum JwksTransportEnvConfig {
+    /// Existing public HTTPS behavior; used when the field is omitted.
+    #[default]
+    PublicHttps,
+    /// HTTP whose authentication, integrity, endpoint authorization, and
+    /// egress restrictions are enforced by the deployment.
+    Mesh,
 }
 
 /// One entry in the `BUZZ_NIP_FI_COMMUNITIES` JSON array.
@@ -218,23 +255,12 @@ impl NipFiCommunities {
     }
 }
 
-/// The authority of a canonical community URI, or `None` unless the URI is
-/// exactly `https://<authority>` and the URL parser reserializes that authority
-/// byte-for-byte. The round trip rejects anything the parser would repair:
-/// whitespace, control characters, backslashes, uppercase, userinfo, path,
-/// query, fragment, a redundant default `:443`, and non-canonical IPv6.
-/// The authority must also already be in `normalize_host()` form, which
-/// rejects a final trailing dot and `:80`, so the Host map key equals the
-/// `aud` authority exactly and is never empty.
-fn canonical_authority(uri: &str) -> Option<&str> {
-    let authority = uri.strip_prefix("https://")?;
-    let parsed = url::Url::parse(uri).ok()?;
-    let host = parsed.host_str()?;
-    let reserialized = match parsed.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_owned(),
-    };
-    (reserialized == authority && normalize_host(authority) == authority).then_some(authority)
+/// Parse `BUZZ_NIP_FI_PROVISION_BINDING`, independent of `BUZZ_NIP_FI_MODE`.
+/// [`buzz_auth::ProvisionBindingPolicy::from_env`] also refuses a suffix that
+/// covers a `BUZZ_NIP_FI_COMMUNITIES` host, for `buzz-admin` too.
+pub fn parse_provision_binding() -> Result<Option<buzz_auth::ProvisionBindingPolicy>, ConfigError> {
+    buzz_auth::ProvisionBindingPolicy::from_env()
+        .map_err(|e| ConfigError::InvalidValue(e.to_string()))
 }
 
 // ── Relay-level NIP-FI config ─────────────────────────────────────────────────
@@ -586,13 +612,20 @@ fn build_issuer(entry: &IssuerEnvConfig) -> Result<(IssuerPolicy, IssuerJwksConf
         }
     };
 
-    let jwks_contract = JwksSourceContract::new(
-        entry.jwks_uri.clone(),
-        entry.jwks_refresh_interval_seconds,
-        entry.jwks_hard_deadline_seconds,
-    )
+    let jwks_contract = match entry.jwks_transport {
+        JwksTransportEnvConfig::PublicHttps => JwksSourceContract::new(
+            entry.jwks_uri.clone(),
+            entry.jwks_refresh_interval_seconds,
+            entry.jwks_hard_deadline_seconds,
+        ),
+        JwksTransportEnvConfig::Mesh => JwksSourceContract::new_mesh(
+            entry.jwks_uri.clone(),
+            entry.jwks_refresh_interval_seconds,
+            entry.jwks_hard_deadline_seconds,
+        ),
+    }
     .ok_or_else(|| {
-        "invalid JWKS source contract (check jwks_uri is HTTPS, \
+        "invalid JWKS source contract (check jwks_transport and jwks_uri, \
              refresh_interval < hard_deadline, and both are positive)"
             .to_string()
     })?;
@@ -835,6 +868,100 @@ mod tests {
             "maximum_command_age_seconds": 30,
             "authorized_principals": ["admin@issuer.test"]
         })
+    }
+
+    #[test]
+    fn jwks_transport_defaults_to_public_and_is_per_issuer() {
+        let _guard = super::NIP_FI_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = EnvGuard::new(NIP_FI_VARS);
+
+        let public = valid_enforce_issuer();
+        let mut mesh = valid_enforce_issuer();
+        mesh["issuer"] = "https://mesh-issuer.test".into();
+        mesh["jwks_uri"] = "http://mesh.example.test/.well-known/jwks.json".into();
+        mesh["jwks_transport"] = "mesh".into();
+
+        std::env::set_var("BUZZ_NIP_FI_MODE", "enforce");
+        std::env::set_var("BUZZ_NIP_FI_MAX_CONNECTION_LIFETIME_SECS", "3600");
+        set_issuers(serde_json::json!([public, mesh]).to_string());
+        let cfg = NipFiRelayConfig::from_env().expect("mixed transport config is valid");
+
+        let public_policy = cfg
+            .registry
+            .policy_for_issuer("https://issuer.test")
+            .expect("public issuer is registered");
+        let mesh_policy = cfg
+            .registry
+            .policy_for_issuer("https://mesh-issuer.test")
+            .expect("mesh issuer is registered");
+        let public_contract = JwksSourceContract::new(
+            "https://issuer.test/.well-known/jwks.json".to_owned(),
+            300,
+            3600,
+        )
+        .expect("valid public contract");
+        let mesh_contract = JwksSourceContract::new_mesh(
+            "http://mesh.example.test/.well-known/jwks.json".to_owned(),
+            300,
+            3600,
+        )
+        .expect("valid mesh contract");
+
+        assert_eq!(public_policy.jwks_source_contract(), &public_contract);
+        assert_eq!(mesh_policy.jwks_source_contract(), &mesh_contract);
+        assert_eq!(public_policy.issuer(), "https://issuer.test");
+        assert_eq!(mesh_policy.issuer(), "https://mesh-issuer.test");
+        for policy in [public_policy, mesh_policy] {
+            assert_eq!(policy.command_audiences().len(), 1);
+            assert_eq!(policy.command_audiences()[0], "https://relay.test");
+            assert_eq!(policy.community_audiences().len(), 1);
+            assert_eq!(policy.community_audiences()[0], "https://relay.test");
+        }
+        assert_eq!(cfg.jwks_configs.len(), 2);
+        assert_eq!(cfg.jwks_configs[0].contract, public_contract);
+        assert_eq!(cfg.jwks_configs[1].contract, mesh_contract);
+    }
+
+    #[test]
+    fn invalid_jwks_transport_is_rejected_without_echoing_uri() {
+        let _guard = super::NIP_FI_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = EnvGuard::new(NIP_FI_VARS);
+
+        std::env::set_var("BUZZ_NIP_FI_MODE", "enforce");
+        std::env::set_var("BUZZ_NIP_FI_MAX_CONNECTION_LIFETIME_SECS", "3600");
+
+        let mut unknown = valid_enforce_issuer();
+        unknown["jwks_uri"] = "https://sentinel-uri.example.test/jwks".into();
+        unknown["jwks_transport"] = "sentinel-unknown-transport".into();
+        set_issuers(serde_json::json!([unknown]).to_string());
+        let error = NipFiRelayConfig::from_env().expect_err("unknown transport must fail");
+        let message = error.to_string();
+        assert!(message.contains("BUZZ_NIP_FI_ISSUERS"));
+        assert!(!message.contains("sentinel-uri.example.test"));
+        assert!(!message.contains("sentinel-unknown-transport"));
+
+        let mut implicit_http = valid_enforce_issuer();
+        implicit_http["jwks_uri"] = "http://sentinel-uri.example.test/jwks".into();
+        set_issuers(serde_json::json!([implicit_http]).to_string());
+        let error = NipFiRelayConfig::from_env()
+            .expect_err("HTTP without an explicit mesh transport must fail");
+        let message = error.to_string();
+        assert!(message.contains("invalid JWKS source contract"));
+        assert!(!message.contains("sentinel-uri.example.test"));
+
+        let mut wrong_scheme = valid_enforce_issuer();
+        wrong_scheme["jwks_uri"] = "https://sentinel-uri.example.test/jwks".into();
+        wrong_scheme["jwks_transport"] = "mesh".into();
+        set_issuers(serde_json::json!([wrong_scheme]).to_string());
+        let error =
+            NipFiRelayConfig::from_env().expect_err("mesh transport must reject HTTPS scheme");
+        let message = error.to_string();
+        assert!(message.contains("invalid JWKS source contract"));
+        assert!(!message.contains("sentinel-uri.example.test"));
     }
 
     #[test]
@@ -1372,6 +1499,75 @@ mod tests {
 
     fn community_entry(uri: &str, issuers: &[&str]) -> serde_json::Value {
         serde_json::json!({ "canonical_uri": uri, "authorized_issuers": issuers })
+    }
+
+    /// Startup (`Config::from_env`) with `BUZZ_NIP_FI_COMMUNITIES` declaring
+    /// `a.relay.test` and a provisioning binding under `suffix`.
+    fn startup_with_provision_suffix(mode: &str, suffix: &str) -> Result<(), String> {
+        enforce_with_communities(serde_json::json!([community_entry(
+            "https://a.relay.test",
+            &["https://issuer.test", "https://issuer-b.test"]
+        )]))
+        .expect("valid enforce config");
+        std::env::set_var("BUZZ_NIP_FI_MODE", mode);
+        std::env::set_var(
+            buzz_auth::nip_fi::provision::PROVISION_BINDING_ENV,
+            serde_json::json!({
+                "host_suffix": suffix,
+                "authorized_issuers": ["https://issuer.test"],
+            })
+            .to_string(),
+        );
+        crate::config::Config::from_env()
+            .map(|cfg| assert!(cfg.nip_fi_provision_binding.is_some()))
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn provision_binding_overlap_rejects_startup_in_every_mode() {
+        let _guard = super::NIP_FI_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = EnvGuard::new(NIP_FI_VARS);
+        let _binding = EnvGuard::new(&[buzz_auth::nip_fi::provision::PROVISION_BINDING_ENV]);
+        for mode in ["off", "enforce"] {
+            let err = startup_with_provision_suffix(mode, "relay.test")
+                .expect_err("suffix covering an enterprise host");
+            assert!(
+                err.contains("covers a BUZZ_NIP_FI_COMMUNITIES host"),
+                "{mode}: {err}"
+            );
+            startup_with_provision_suffix(mode, "communities.buzz.xyz")
+                .unwrap_or_else(|e| panic!("{mode}: disjoint suffix must start: {e}"));
+        }
+    }
+
+    #[test]
+    fn provision_binding_off_mode_refuses_unreadable_enterprise_hosts() {
+        let _guard = super::NIP_FI_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = EnvGuard::new(NIP_FI_VARS);
+        let _binding = EnvGuard::new(&[buzz_auth::nip_fi::provision::PROVISION_BINDING_ENV]);
+        startup_with_provision_suffix("off", "communities.buzz.xyz").expect("valid start");
+        for communities in [
+            "not json".to_string(),
+            serde_json::json!([community_entry(
+                "https://A.relay.test",
+                &["https://issuer.test"]
+            )])
+            .to_string(),
+        ] {
+            std::env::set_var("BUZZ_NIP_FI_COMMUNITIES", &communities);
+            let err = crate::config::Config::from_env()
+                .map(|_| ())
+                .expect_err("unreadable enterprise hosts");
+            assert!(
+                err.to_string()
+                    .contains("BUZZ_NIP_FI_COMMUNITIES hosts are unreadable"),
+                "{communities}: {err}"
+            );
+        }
     }
 
     #[test]

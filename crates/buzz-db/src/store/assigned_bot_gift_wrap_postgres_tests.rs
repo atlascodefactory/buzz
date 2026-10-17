@@ -98,7 +98,7 @@ async fn gift_wrap_keeps_actor_locked_after_insert_until_commit() {
     f.apply(&f.command(false, 1, Uuid::new_v4())).await.unwrap();
     let db = crate::Db::from_pool(f.pool.clone());
     let event = envelope(&f, &Keys::generate());
-    let mut insertion = db.begin_event_write_transaction().await.unwrap();
+    let mut insertion = db.begin_event_write_transaction(f.community).await.unwrap();
     db.insert_authenticated_gift_wrap_in_transaction(
         &mut insertion,
         f.community,
@@ -112,9 +112,9 @@ async fn gift_wrap_keeps_actor_locked_after_insert_until_commit() {
     let pool = f.pool.clone();
     let (started, waiting) = tokio::sync::oneshot::channel();
     let revoke = tokio::spawn(async move {
-        let mut tx = pool.begin().await.unwrap();
+        let mut tx = admitted(&pool, command.community()).await.unwrap();
         let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-            .fetch_one(&mut *tx)
+            .fetch_one(tx.conn())
             .await
             .unwrap();
         started.send(pid).unwrap();

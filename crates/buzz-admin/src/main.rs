@@ -20,8 +20,9 @@
 //! newest timestamp and collide on the bumped second. run.sh serialization is
 //! the guard against parallel adds (e.g. `xargs -P`).
 
+mod communities;
 mod deletions;
-mod storage_snapshot_startup;
+mod nip_fi;
 
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,7 +32,10 @@ use std::time::Instant;
 use anyhow::Result;
 use buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST;
 use buzz_core::tenant::{relay_url_authority, TenantContext};
-use buzz_db::{partition::PartitionAuditReport, Db, DbConfig};
+use buzz_db::{
+    partition::{PartitionAuditOutcome, PartitionAuditReport},
+    Db, DbConfig,
+};
 use buzz_media::{BucketSnapshot, MediaConfig, MediaStorage, S3AddressingStyle, SweepError};
 use buzz_pubsub::{EventTopic, PubSubManager};
 use clap::{Parser, Subcommand};
@@ -94,13 +98,23 @@ enum Command {
     /// Run the partition catalog audit using a read-only database session.
     PartitionAudit {
         /// Future months to include in the coverage check.
-        #[arg(long, default_value_t = 3)]
+        #[arg(long, default_value_t = buzz_db::partition::PARTITION_MANAGER_MONTHS_AHEAD)]
         months_ahead: u32,
     },
     /// Inspect deployment-wide Buzz product feedback.
     ProductFeedback {
         #[command(subcommand)]
         command: ProductFeedbackCommand,
+    },
+    /// Reversible whole-community lifecycle controls.
+    Communities {
+        #[command(subcommand)]
+        command: communities::CommunitiesCommand,
+    },
+    /// NIP-FI community issuer bindings.
+    NipFi {
+        #[command(subcommand)]
+        command: nip_fi::NipFiCommand,
     },
     /// Durable CLI-only whole-community deletion control plane.
     Deletions {
@@ -181,11 +195,22 @@ async fn run(cli: Cli) -> Result<i32> {
         Command::ProductFeedback {
             command: ProductFeedbackCommand::List { limit },
         } => cmd_list_product_feedback(limit).await,
+        Command::Communities { command } => communities::run(command).await,
         Command::Deletions { command } => deletions::run(command).await,
+        Command::NipFi { command } => nip_fi::run(command).await,
         Command::ReconcileChannels { channel, relay_key } => {
             reconcile_channels(channel, relay_key).await?;
             Ok(0)
         }
+    }
+}
+
+/// One session: the worker detaches its lock-owning connection, and the
+/// cold-start pool opens no idle replacements while it scans S3.
+fn storage_snapshot_db_config(base: DbConfig) -> DbConfig {
+    DbConfig {
+        max_connections: 1,
+        ..base
     }
 }
 
@@ -196,7 +221,11 @@ async fn cmd_storage_snapshot(max_objects: u64) -> Result<i32> {
         return Err(anyhow::anyhow!("--max-objects must be greater than zero"));
     }
 
-    let db = storage_snapshot_startup::connect_db().await?;
+    let db = Db::connect_cold_start(
+        storage_snapshot_db_config(db_config_from_env()),
+        "storage_snapshot",
+    )
+    .await?;
     let mut leader = db.try_lock_storage_accounting().await?.ok_or_else(|| {
         anyhow::anyhow!("another storage-snapshot worker already holds the lease")
     })?;
@@ -339,7 +368,7 @@ struct PartitionAuditOutput {
     source_sha: &'static str,
     build_id: &'static str,
     build_url: &'static str,
-    outcome: &'static str,
+    outcome: PartitionAuditOutcome,
     months_ahead: u32,
     identity: PartitionAuditIdentity,
     report: PartitionAuditReport,
@@ -380,20 +409,8 @@ async fn cmd_partition_audit(months_ahead: u32) -> Result<i32> {
     let report = Db::from_pool(pool)
         .audit_partitions_report(months_ahead)
         .await;
-    let outcome = if !report.errors.is_empty() {
-        "error"
-    } else if !report.serving_safe() {
-        "unsafe"
-    } else if report.tables.iter().any(|table| table.degraded()) {
-        "degraded"
-    } else {
-        "ok"
-    };
-    let code = match outcome {
-        "error" => 5,
-        "unsafe" => 2,
-        _ => 0,
-    };
+    let outcome = report.outcome();
+    let code = partition_audit_exit_code(outcome);
     println!(
         "{}",
         serde_json::to_string_pretty(&PartitionAuditOutput {
@@ -409,6 +426,15 @@ async fn cmd_partition_audit(months_ahead: u32) -> Result<i32> {
         })?
     );
     Ok(code)
+}
+
+/// Exit nonzero only when the audit is incomplete or a table cannot serve.
+fn partition_audit_exit_code(outcome: PartitionAuditOutcome) -> i32 {
+    match outcome {
+        PartitionAuditOutcome::Error => 5,
+        PartitionAuditOutcome::Unsafe => 2,
+        PartitionAuditOutcome::Degraded | PartitionAuditOutcome::Ok => 0,
+    }
 }
 
 async fn cmd_add_member(pubkey_arg: String, role: String) -> Result<i32> {
@@ -720,6 +746,7 @@ async fn reconcile_channels(
     channel_arg: Option<String>,
     relay_key_arg: Option<String>,
 ) -> Result<()> {
+    use buzz_core::channel::{channel_created_at_tag, group_state_identity_tags};
     use buzz_core::kind::KIND_NIP29_GROUP_ADMINS;
     use buzz_db::event::EventQuery;
 
@@ -816,11 +843,18 @@ async fn reconcile_channels(
                 } else {
                     tags.push(Tag::parse(["public"])?);
                 }
-                if channel.channel_type == "dm" {
+                if channel.channel_type == "dm"
+                    || (channel.channel_type == "system" && channel.visibility == "private")
+                {
                     tags.push(Tag::parse(["hidden"])?);
                 }
                 tags.push(Tag::parse(["closed"])?);
-                tags.push(Tag::parse(["t", &channel.channel_type])?);
+                tags.extend(group_state_identity_tags(
+                    &channel.channel_type,
+                    &channel.labels,
+                    &channel.created_by,
+                )?);
+                tags.push(channel_created_at_tag(channel.created_at.timestamp())?);
 
                 let event = EventBuilder::new(Kind::Custom(39000), "")
                     .tags(tags)
@@ -833,6 +867,11 @@ async fn reconcile_channels(
             // kind:39001 — admins
             {
                 let mut tags: Vec<Tag> = vec![Tag::parse(["d", &channel_id_str])?];
+                tags.extend(group_state_identity_tags(
+                    &channel.channel_type,
+                    &channel.labels,
+                    &channel.created_by,
+                )?);
                 for m in members
                     .iter()
                     .filter(|m| m.role == "owner" || m.role == "admin")
@@ -852,6 +891,11 @@ async fn reconcile_channels(
         // kind:39002 — members
         {
             let mut tags: Vec<Tag> = vec![Tag::parse(["d", &channel_id_str])?];
+            tags.extend(group_state_identity_tags(
+                &channel.channel_type,
+                &channel.labels,
+                &channel.created_by,
+            )?);
             for m in &members {
                 let pk = hex::encode(&m.pubkey);
                 tags.push(Tag::parse(["p", &pk, "", &m.role])?);
@@ -879,6 +923,17 @@ mod storage_snapshot_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn storage_snapshot_holds_a_single_database_session() {
+        let config = storage_snapshot_db_config(DbConfig {
+            max_connections: 20,
+            lock_timeout_ms: 123,
+            ..DbConfig::default()
+        });
+        assert_eq!(config.max_connections, 1);
+        assert_eq!(config.lock_timeout_ms, 123);
+    }
 
     #[tokio::test]
     async fn failed_fold_never_invokes_snapshot_persistence() {
@@ -910,5 +965,167 @@ mod tests {
             cli.command,
             Command::PartitionAudit { months_ahead: 6 }
         ));
+    }
+
+    const OWNER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn communities_command_parses_archive() {
+        let cli = Cli::try_parse_from([
+            "buzz-admin",
+            "communities",
+            "archive",
+            "--host",
+            "example.communities.buzz.xyz",
+            "--owner-pubkey",
+            OWNER,
+            "--operator-id",
+            "codex",
+            "--reason",
+            "requested deletion",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Communities {
+                command:
+                    communities::CommunitiesCommand::Archive {
+                        host,
+                        owner_pubkey,
+                        operator_id,
+                        reason,
+                    },
+            } => {
+                assert_eq!(host, "example.communities.buzz.xyz");
+                assert_eq!(owner_pubkey, OWNER);
+                assert_eq!(operator_id, "codex");
+                assert_eq!(reason, "requested deletion");
+            }
+            _ => panic!("expected communities archive command"),
+        }
+    }
+
+    #[test]
+    fn communities_command_parses_unarchive() {
+        let cli = Cli::try_parse_from([
+            "buzz-admin",
+            "communities",
+            "unarchive",
+            "--host",
+            "example.communities.buzz.xyz",
+            "--owner-pubkey",
+            OWNER,
+            "--operator-id",
+            "codex",
+            "--reason",
+            "rollback",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Communities {
+                command:
+                    communities::CommunitiesCommand::Unarchive {
+                        host,
+                        owner_pubkey,
+                        operator_id,
+                        reason,
+                    },
+            } => {
+                assert_eq!(host, "example.communities.buzz.xyz");
+                assert_eq!(owner_pubkey, OWNER);
+                assert_eq!(operator_id, "codex");
+                assert_eq!(reason, "rollback");
+            }
+            _ => panic!("expected communities unarchive command"),
+        }
+    }
+
+    #[test]
+    fn communities_commands_require_all_safety_and_audit_arguments() {
+        let missing_argument_cases = [
+            vec![
+                "buzz-admin",
+                "communities",
+                "archive",
+                "--owner-pubkey",
+                OWNER,
+                "--operator-id",
+                "codex",
+                "--reason",
+                "requested deletion",
+            ],
+            vec![
+                "buzz-admin",
+                "communities",
+                "archive",
+                "--host",
+                "example.communities.buzz.xyz",
+                "--operator-id",
+                "codex",
+                "--reason",
+                "requested deletion",
+            ],
+            vec![
+                "buzz-admin",
+                "communities",
+                "unarchive",
+                "--host",
+                "example.communities.buzz.xyz",
+                "--owner-pubkey",
+                OWNER,
+                "--reason",
+                "rollback",
+            ],
+            vec![
+                "buzz-admin",
+                "communities",
+                "unarchive",
+                "--host",
+                "example.communities.buzz.xyz",
+                "--owner-pubkey",
+                OWNER,
+                "--operator-id",
+                "codex",
+            ],
+        ];
+
+        for args in missing_argument_cases {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn communities_commands_do_not_expose_deletion_approval_arguments() {
+        let command = Cli::try_parse_from([
+            "buzz-admin",
+            "communities",
+            "archive",
+            "--host",
+            "example.communities.buzz.xyz",
+            "--owner-pubkey",
+            OWNER,
+            "--operator-id",
+            "codex",
+            "--reason",
+            "requested deletion",
+            "--approved-by",
+            "second-operator",
+        ]);
+
+        assert!(command.is_err());
+    }
+
+    #[test]
+    fn partition_audit_outcomes_keep_their_json_names_and_exit_codes() {
+        for (outcome, name, code) in [
+            (PartitionAuditOutcome::Ok, "ok", 0),
+            (PartitionAuditOutcome::Degraded, "degraded", 0),
+            (PartitionAuditOutcome::Unsafe, "unsafe", 2),
+            (PartitionAuditOutcome::Error, "error", 5),
+        ] {
+            assert_eq!(serde_json::to_value(outcome).unwrap(), name);
+            assert_eq!(partition_audit_exit_code(outcome), code, "{name}");
+        }
     }
 }

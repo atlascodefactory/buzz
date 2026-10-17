@@ -7,7 +7,9 @@
 use buzz_core::assigned_bot::{AssignedBotCommand, AssignedBotOperation};
 use buzz_core::CommunityId;
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{PgPool, Row};
+#[cfg(test)]
+use sqlx::{Postgres, Transaction};
 
 use crate::{DbError, Result};
 
@@ -24,12 +26,17 @@ pub use inspection::inspect_in_transaction;
 /// allowed only after the old one is revoked. Exact replay never re-adds a bot.
 /// No NIP-OA owner field or repository capability is written by this function.
 pub async fn apply_in_transaction(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut crate::AdmittedTx,
     command: &AssignedBotCommand,
 ) -> Result<bool> {
     if matches!(command.operation(), AssignedBotOperation::Inspect { .. }) {
         return Err(DbError::InvalidData(
             "inspection cannot mutate an assignment".into(),
+        ));
+    }
+    if tx.community() != command.community() {
+        return Err(DbError::AccessDenied(
+            "assignment community mismatch".into(),
         ));
     }
     let community = *command.community().as_uuid();
@@ -41,7 +48,7 @@ pub async fn apply_in_transaction(
             "buzz_assigned_bot:{community}:{}",
             hex::encode(bot)
         ))
-        .execute(&mut **tx)
+        .execute(tx.conn())
         .await?;
     require_current_lifetime(tx, command).await?;
     sqlx::query(
@@ -49,14 +56,14 @@ pub async fn apply_in_transaction(
          VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (community_id, bot_pubkey) DO NOTHING",
     ).bind(community).bind(bot.as_slice()).bind(command.assignment_id())
         .bind(authority.as_slice()).bind(owner.as_slice()).bind(command.generation())
-        .execute(&mut **tx).await?;
+        .execute(tx.conn()).await?;
     let current = sqlx::query(
         "SELECT assignment_id, authority_pubkey, owner_pubkey, generation, revoked_at \
          FROM assigned_bots WHERE community_id = $1 AND bot_pubkey = $2 FOR UPDATE",
     )
     .bind(community)
     .bind(bot.as_slice())
-    .fetch_one(&mut **tx)
+    .fetch_one(tx.conn())
     .await?;
     let generation: i64 = current.try_get("generation")?;
     let revoked: Option<DateTime<Utc>> = current.try_get("revoked_at")?;
@@ -81,11 +88,11 @@ pub async fn apply_in_transaction(
         "INSERT INTO assigned_bot_commands (community_id, bot_pubkey, nonce, event_id) \
          VALUES ($1, $2, $3, $4) ON CONFLICT (community_id, bot_pubkey, nonce) DO NOTHING RETURNING event_id",
     ).bind(community).bind(bot.as_slice()).bind(command.nonce())
-        .bind(command.event_id().to_bytes().as_slice()).fetch_optional(&mut **tx).await?;
+        .bind(command.event_id().to_bytes().as_slice()).fetch_optional(tx.conn()).await?;
     if receipt.is_none() {
         let previous: Vec<u8> = sqlx::query_scalar(
             "SELECT event_id FROM assigned_bot_commands WHERE community_id = $1 AND bot_pubkey = $2 AND nonce = $3",
-        ).bind(community).bind(bot.as_slice()).bind(command.nonce()).fetch_one(&mut **tx).await?;
+        ).bind(community).bind(bot.as_slice()).bind(command.nonce()).fetch_one(tx.conn()).await?;
         if previous != command.event_id().to_bytes() {
             return Err(DbError::AccessDenied("assignment nonce was reused".into()));
         }
@@ -112,18 +119,13 @@ pub async fn apply_in_transaction(
                 .bind(community)
                 .bind(bot.as_slice())
                 .bind(command.generation())
-                .execute(&mut **tx)
+                .execute(tx.conn())
                 .await?;
             }
         }
         AssignedBotOperation::Revoke => {
-            let (_, inserted) = crate::event::insert_event_in_transaction(
-                tx,
-                command.community(),
-                command.event(),
-                None,
-            )
-            .await?;
+            let (_, inserted) =
+                crate::event::insert_event_in_transaction(tx, command.event(), None).await?;
             if !inserted {
                 return Err(DbError::AccessDenied(
                     "command already exists without its receipt".into(),
@@ -133,18 +135,18 @@ pub async fn apply_in_transaction(
                 "UPDATE assigned_bots SET generation = $3, revoked_at = COALESCE(revoked_at, clock_timestamp()) \
                  WHERE community_id = $1 AND bot_pubkey = $2",
             ).bind(community).bind(bot.as_slice()).bind(command.generation())
-                .execute(&mut **tx).await?;
+                .execute(tx.conn()).await?;
         }
     }
     Ok(true)
 }
 
 async fn require_current_lifetime(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut crate::AdmittedTx,
     command: &AssignedBotCommand,
 ) -> Result<()> {
     let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
-        .fetch_one(&mut **tx)
+        .fetch_one(tx.conn())
         .await?;
     let now = u64::try_from(now.timestamp())
         .map_err(|_| DbError::InvalidData("invalid database clock".into()))?;
@@ -235,7 +237,7 @@ impl crate::Db {
         event: &nostr::Event,
         actor: &nostr::PublicKey,
     ) -> Result<(buzz_core::StoredEvent, bool)> {
-        let mut tx = self.begin_event_write_transaction().await?;
+        let mut tx = self.begin_event_write_transaction(community).await?;
         let result = self
             .insert_authenticated_gift_wrap_in_transaction(&mut tx, community, event, actor)
             .await?;
@@ -245,7 +247,7 @@ impl crate::Db {
 
     async fn insert_authenticated_gift_wrap_in_transaction(
         &self,
-        tx: &mut Transaction<'_, Postgres>,
+        tx: &mut crate::AdmittedTx,
         community: CommunityId,
         event: &nostr::Event,
         actor: &nostr::PublicKey,
@@ -253,9 +255,9 @@ impl crate::Db {
         if event.kind != nostr::Kind::GiftWrap {
             return Err(DbError::InvalidData("expected gift-wrap envelope".into()));
         }
-        self.deletion_store()
-            .guard_transaction(tx, community)
-            .await?;
+        if tx.community() != community {
+            return Err(DbError::AccessDenied("gift-wrap community mismatch".into()));
+        }
         let mut principals = vec![actor.to_bytes(), event.pubkey.to_bytes()];
         principals.sort_unstable();
         principals.dedup();
@@ -267,21 +269,20 @@ impl crate::Db {
                     "buzz_assigned_bot:{community}:{}",
                     hex::encode(principal)
                 ))
-                .execute(&mut **tx)
+                .execute(tx.conn())
                 .await?;
         }
         for principal in &principals {
             sqlx::query("SELECT lock_assigned_bot_event_actor($1, $2, NULL)")
                 .bind(community.as_uuid())
                 .bind(principal.as_slice())
-                .execute(&mut **tx)
+                .execute(tx.conn())
                 .await?;
         }
         let result =
-            crate::event::insert_event_with_thread_metadata_tx(tx, community, event, None, None)
-                .await?;
+            crate::event::insert_event_with_thread_metadata_tx(tx, event, None, None).await?;
         if result.1 {
-            crate::insert_mentions_in_transaction(tx, community, event, None).await?;
+            crate::insert_mentions_in_transaction(tx, event, None).await?;
         }
         Ok(result)
     }

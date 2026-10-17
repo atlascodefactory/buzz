@@ -1,3 +1,12 @@
+async fn admitted(pool: &PgPool, community: CommunityId) -> Result<crate::AdmittedTx> {
+    crate::begin_community_event_write_transaction(
+        pool,
+        community,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await
+}
+
 use super::*;
 use buzz_core::assigned_bot::{AssignedBotCommand, AssignedBotOperation};
 use buzz_core::kind;
@@ -71,6 +80,7 @@ impl Fixture {
             None,
             &owner.public_key().to_bytes(),
             None,
+            &[],
         )
         .await
         .unwrap()
@@ -176,7 +186,7 @@ impl Fixture {
 }
 
 async fn apply(pool: &PgPool, command: &AssignedBotCommand) -> Result<bool> {
-    let mut tx = pool.begin().await?;
+    let mut tx = admitted(pool, command.community()).await?;
     let outcome = apply_in_transaction(&mut tx, command).await;
     match outcome {
         Ok(inserted) => {
@@ -270,22 +280,17 @@ async fn durable_insert_rechecks_assignment_after_earlier_allow() {
 async fn durable_insert_holds_assignment_until_its_commit() {
     let f = Fixture::new().await;
     f.apply(&f.command(false, 1, Uuid::new_v4())).await.unwrap();
-    let mut insert = f.pool.begin().await.unwrap();
+    let mut insert = admitted(&f.pool, f.community).await.unwrap();
     let event = bot_message(&f);
     assert!(
-        crate::event::insert_event_in_transaction(
-            &mut insert,
-            f.community,
-            &event,
-            Some(f.channel)
-        )
-        .await
-        .unwrap()
-        .1
+        crate::event::insert_event_in_transaction(&mut insert, &event, Some(f.channel))
+            .await
+            .unwrap()
+            .1
     );
-    let mut withdrawal = f.pool.begin().await.unwrap();
+    let mut withdrawal = admitted(&f.pool, f.community).await.unwrap();
     sqlx::query("SET LOCAL lock_timeout = '100ms'")
-        .execute(&mut *withdrawal)
+        .execute(withdrawal.conn())
         .await
         .unwrap();
     let revoke = f.command(true, 1, Uuid::new_v4());
@@ -315,17 +320,12 @@ async fn durable_insert_holds_assignment_until_its_commit() {
 async fn durable_insert_holds_current_owner_membership_until_commit() {
     let f = Fixture::new().await;
     f.apply(&f.command(false, 1, Uuid::new_v4())).await.unwrap();
-    let mut insert = f.pool.begin().await.unwrap();
+    let mut insert = admitted(&f.pool, f.community).await.unwrap();
     assert!(
-        crate::event::insert_event_in_transaction(
-            &mut insert,
-            f.community,
-            &bot_message(&f),
-            Some(f.channel)
-        )
-        .await
-        .unwrap()
-        .1
+        crate::event::insert_event_in_transaction(&mut insert, &bot_message(&f), Some(f.channel))
+            .await
+            .unwrap()
+            .1
     );
     let mut removal = f.pool.begin().await.unwrap();
     sqlx::query("SET LOCAL lock_timeout = '100ms'")
@@ -372,15 +372,14 @@ async fn durable_insert_after_waiting_for_owner_removal_uses_fresh_snapshot() {
     let event_id = event.id.to_bytes();
     let (started, waiting) = tokio::sync::oneshot::channel();
     let insert = tokio::spawn(async move {
-        let mut tx = pool.begin().await.unwrap();
+        let mut tx = admitted(&pool, community).await.unwrap();
         let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-            .fetch_one(&mut *tx)
+            .fetch_one(tx.conn())
             .await
             .unwrap();
         started.send(pid).unwrap();
         let result =
-            crate::event::insert_event_in_transaction(&mut tx, community, &event, Some(channel))
-                .await;
+            crate::event::insert_event_in_transaction(&mut tx, &event, Some(channel)).await;
         tx.rollback().await.unwrap();
         result
     });
@@ -422,31 +421,25 @@ async fn durable_ephemeral_inserts_do_not_share_to_update_deadlock() {
             .fetch_one(&f.pool)
             .await
             .unwrap();
-    let mut first = f.pool.begin().await.unwrap();
-    crate::event::insert_event_in_transaction(
-        &mut first,
-        f.community,
-        &bot_message(&f),
-        Some(f.channel),
-    )
-    .await
-    .unwrap();
+    let mut first = admitted(&f.pool, f.community).await.unwrap();
+    crate::event::insert_event_in_transaction(&mut first, &bot_message(&f), Some(f.channel))
+        .await
+        .unwrap();
     let (pool, community, channel, event) =
         (f.pool.clone(), f.community, f.channel, bot_message(&f));
     let (started, waiting) = tokio::sync::oneshot::channel();
     let (inserted, insertion_observed) = tokio::sync::oneshot::channel();
     let (release_commit, may_commit) = tokio::sync::oneshot::channel();
     let second = tokio::spawn(async move {
-        let mut tx = pool.begin().await.unwrap();
+        let mut tx = admitted(&pool, community).await.unwrap();
         let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-            .fetch_one(&mut *tx)
+            .fetch_one(tx.conn())
             .await
             .unwrap();
         started.send(pid).unwrap();
-        let result =
-            crate::event::insert_event_in_transaction(&mut tx, community, &event, Some(channel))
-                .await
-                .unwrap();
+        let result = crate::event::insert_event_in_transaction(&mut tx, &event, Some(channel))
+            .await
+            .unwrap();
         inserted.send(()).unwrap();
         may_commit.await.unwrap();
         tx.commit().await.unwrap();
@@ -504,15 +497,14 @@ async fn durable_insert_takes_ttl_lock_before_channel_row() {
         (f.pool.clone(), f.community, f.channel, bot_message(&f));
     let (started, waiting) = tokio::sync::oneshot::channel();
     let insert = tokio::spawn(async move {
-        let mut tx = pool.begin().await.unwrap();
+        let mut tx = admitted(&pool, community).await.unwrap();
         let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-            .fetch_one(&mut *tx)
+            .fetch_one(tx.conn())
             .await
             .unwrap();
         started.send(pid).unwrap();
         let result =
-            crate::event::insert_event_in_transaction(&mut tx, community, &event, Some(channel))
-                .await;
+            crate::event::insert_event_in_transaction(&mut tx, &event, Some(channel)).await;
         tx.commit().await.unwrap();
         result
     });
@@ -689,7 +681,7 @@ async fn bootstrap_does_not_reactivate_an_existing_bot_identity() {
 #[ignore = "requires Postgres"]
 async fn admission_holds_owner_relay_membership_until_commit() {
     let f = Fixture::new().await;
-    let mut admission = f.pool.begin().await.unwrap();
+    let mut admission = admitted(&f.pool, f.community).await.unwrap();
     assert!(
         apply_in_transaction(&mut admission, &f.command(false, 1, Uuid::new_v4()))
             .await
@@ -765,14 +757,10 @@ async fn nobody_and_existing_privileged_roles_never_get_overwritten() {
 #[ignore = "requires Postgres"]
 async fn membership_removed_while_waiting_is_checked_under_writer_lock() {
     let f = Fixture::new().await;
-    let mut holder = f.pool.begin().await.unwrap();
-    crate::channel_members::acquire_channel_membership_lock_in_transaction(
-        &mut holder,
-        f.community,
-        f.channel,
-    )
-    .await
-    .unwrap();
+    let mut holder = admitted(&f.pool, f.community).await.unwrap();
+    crate::channel_members::acquire_channel_membership_lock_in_transaction(&mut holder, f.channel)
+        .await
+        .unwrap();
     let pool = f.pool.clone();
     let command = f.command(false, 1, Uuid::new_v4());
     let task = tokio::spawn(async move { apply(&pool, &command).await });
@@ -783,7 +771,7 @@ async fn membership_removed_while_waiting_is_checked_under_writer_lock() {
     )
     .bind(f.community.as_uuid())
     .bind(f.channel)
-    .execute(&mut *holder)
+    .execute(holder.conn())
     .await
     .unwrap();
     holder.commit().await.unwrap();
@@ -876,6 +864,7 @@ async fn higher_generation_cannot_rebind_owner_and_reactivate_old_private_rooms(
         None,
         &foreign.public_key().to_bytes(),
         None,
+        &[],
     )
     .await
     .unwrap()
@@ -1002,6 +991,7 @@ async fn assigned_access_open_rooms_require_current_owner_and_bot_memberships() 
         None,
         f.owner.public_key().as_bytes(),
         None,
+        &[],
     )
     .await
     .unwrap()
@@ -1059,6 +1049,87 @@ async fn assigned_access_open_rooms_require_current_owner_and_bot_memberships() 
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn assigned_access_system_rooms_require_current_owner_membership() {
+    let f = Fixture::new().await;
+    f.apply(&f.command(false, 1, Uuid::new_v4())).await.unwrap();
+    let bot = f.bot.public_key().to_bytes();
+    let owner = f.owner.public_key().to_bytes();
+
+    for visibility in ["open", "private"] {
+        let mut tx = admitted(&f.pool, f.community).await.unwrap();
+        sqlx::query(
+            "UPDATE channels SET channel_type = 'system', visibility = $3::channel_visibility \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(f.community.as_uuid())
+        .bind(f.channel)
+        .bind(visibility)
+        .execute(tx.conn())
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert!(
+            crate::channel_members::get_readable_system_channel_ids(&f.pool, f.community, &bot)
+                .await
+                .unwrap()
+                .contains(&f.channel)
+        );
+
+        // Retain the bot's membership and global assignment while its owner leaves.
+        let mut tx = admitted(&f.pool, f.community).await.unwrap();
+        sqlx::query(
+            "UPDATE channel_members SET removed_at = NOW() \
+             WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3",
+        )
+        .bind(f.community.as_uuid())
+        .bind(f.channel)
+        .bind(owner.as_slice())
+        .execute(tx.conn())
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            access_status(&f.pool, f.community, &bot, None).await.unwrap(),
+            Some(true)
+        );
+        assert!(
+            !crate::channel_members::get_readable_system_channel_ids(&f.pool, f.community, &bot)
+                .await
+                .unwrap()
+                .contains(&f.channel)
+        );
+        // Ordinary members still read open system channels without joining them.
+        assert_eq!(
+            crate::channel_members::get_readable_system_channel_ids(&f.pool, f.community, &owner)
+                .await
+                .unwrap()
+                .contains(&f.channel),
+            visibility == "open"
+        );
+
+        let mut tx = admitted(&f.pool, f.community).await.unwrap();
+        sqlx::query(
+            "UPDATE channel_members SET removed_at = NULL \
+             WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3",
+        )
+        .bind(f.community.as_uuid())
+        .bind(f.channel)
+        .bind(owner.as_slice())
+        .execute(tx.conn())
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert!(
+            crate::channel_members::get_readable_system_channel_ids(&f.pool, f.community, &bot)
+                .await
+                .unwrap()
+                .contains(&f.channel)
+        );
+    }
 }
 
 #[tokio::test]
