@@ -709,7 +709,7 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 66);
+        assert_eq!(migrations.len(), 67);
         assert_eq!(migrations[65].version, 66);
         let retire_ttl = strip_sql_comments(migrations[65].sql.as_str());
         for statement in [
@@ -741,6 +741,11 @@ mod postgres_tests {
             .sql
             .as_str()
             .contains("CREATE FUNCTION profile_name_fields"));
+        assert_eq!(migrations[66].version, 67);
+        assert!(migrations[66]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE community_nip_fi_issuers"));
         assert_eq!(migrations[56].version, 57);
         assert!(migrations[56]
             .sql
@@ -2329,6 +2334,15 @@ mod postgres_tests {
             .collect()
         );
         expected_fences.extend(assignment_migration.fence_attachments);
+        // 0067 fences the NIP-FI issuer bindings table.
+        assert!(MIGRATOR
+            .iter()
+            .find(|m| m.version == 67)
+            .expect("NIP-FI binding migration")
+            .sql
+            .as_str()
+            .contains("attach_community_write_fence('community_nip_fi_issuers')"));
+        expected_fences.insert("community_nip_fi_issuers".to_owned());
         assert_eq!(
             expected_fences, schema.fence_attachments,
             "write-fence attachment targets differ after recovery policy"

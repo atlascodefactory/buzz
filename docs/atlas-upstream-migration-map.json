@@ -1,5 +1,5 @@
 {
-  "upstreamRevision": "bf8b356f3bf551a01cc24041605ca77d009681dd",
+  "upstreamRevision": "6286a5432111f529835da320e801af1901889b03",
   "preservedAppliedMigrations": 56,
   "mapping": [
     {
@@ -51,6 +51,11 @@
       "upstream": "migrations/0065_retire_channel_ttl_trigger.sql",
       "fork": "migrations/0066_retire_channel_ttl_trigger.sql",
       "sha256": "d410797982adfcc6763cfb496e775c6921da1b862d0d3b082b45e4b7c69a91ae"
+    },
+    {
+      "upstream": "migrations/0066_community_nip_fi_issuers.sql",
+      "fork": "migrations/0067_community_nip_fi_issuers.sql",
+      "sha256": "015e2b22fef1f37bfb9d08fb5276996ecda4ef8b8390d5e6195ce56f2e496396"
     }
   ]
 }

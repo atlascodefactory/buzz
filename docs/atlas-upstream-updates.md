@@ -9,7 +9,7 @@ separate media/Git object stores when merging `block/buzz/main`.
 Atlas deployed `0056_assigned_bot_lifecycle.sql` before upstream introduced its
 own migration 0056. Never rename or change the deployed Atlas migration, and
 never overwrite an applied SQLx checksum. For this integration, upstream
-0056–0065 are stored as fork 0057–0066, with identical SQL bytes. The exact
+0056–0066 are stored as fork 0057–0067, with identical SQL bytes. The exact
 mapping and hashes are in `atlas-upstream-migration-map.json`.
 
 On subsequent merges, extend the mapping for new upstream migrations and check
