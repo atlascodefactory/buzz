@@ -138,6 +138,17 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 \i tables/public/artifact_heads.sql
 \i tables/public/artifact_revisions.sql
 
+\i tables/public/assigned_bots.sql
+\i tables/public/assigned_bot_inspections.sql
+\i tables/public/assigned_bot_commands.sql
+
+-- Assigned-agent functions depend on the completed table definitions.
+\i functions/assigned_bot_access_allowed.sql
+\i functions/lock_assigned_bot_creation.sql
+\i functions/lock_assigned_bot_ban_change.sql
+\i functions/lock_assigned_bot_event_actor.sql
+\i functions/enforce_assigned_bot_event_write.sql
+
 -- partitions
 \i partitions/events.sql
 \i partitions/delivery_log.sql
@@ -181,6 +192,10 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 \i triggers/artifact_heads.sql
 \i triggers/artifact_revisions.sql
 
+\i triggers/assigned_bots.sql
+\i triggers/assigned_bot_inspections.sql
+\i triggers/assigned_bot_commands.sql
+
 -- seeds
 \i seeds/communities.sql
 \i seeds/rate_limit_violations.sql
@@ -209,5 +224,4 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 \i seeds/storage_accounting_snapshots.sql
 
 -- Fence any community-scoped table that lacks an explicit attach.
-\i atlas_assigned_bots.sql
 \i community_write_fence.sql

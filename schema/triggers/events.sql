@@ -14,3 +14,7 @@ CREATE CONSTRAINT TRIGGER events_created_at_floor
     FOR EACH ROW
     EXECUTE FUNCTION events_created_at_floor_guard();
 SELECT attach_community_write_fence('events');
+
+-- Run after the existing community write fence so lock ordering is unchanged.
+CREATE TRIGGER zz_assigned_bot_event_write BEFORE INSERT ON events
+FOR EACH ROW EXECUTE FUNCTION enforce_assigned_bot_event_write();

@@ -20,8 +20,8 @@ migration history is not interchangeable with an already migrated upstream DB.
 
 Verify both desired-state bootstrap and upgrade from a restored production
 database. Compare applied checksums before and after, and run the migrator a
-second time to prove it is a no-op. `schema/atlas_assigned_bots.sql` retains
-Atlas's additional functions, tables and triggers in the modular upstream
+second time to prove it is a no-op. The matching files under `schema/tables/public/`, `schema/functions/` and
+`schema/triggers/` retain Atlas's additional objects in the modular upstream
 schema; never remove its `zz_assigned_bot_*` guards when upstream retires its
 push and TTL triggers.
 
