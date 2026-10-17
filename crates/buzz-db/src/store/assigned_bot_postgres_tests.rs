@@ -1053,6 +1053,87 @@ async fn assigned_access_open_rooms_require_current_owner_and_bot_memberships() 
 
 #[tokio::test]
 #[ignore = "requires Postgres"]
+async fn assigned_access_system_rooms_require_current_owner_membership() {
+    let f = Fixture::new().await;
+    f.apply(&f.command(false, 1, Uuid::new_v4())).await.unwrap();
+    let bot = f.bot.public_key().to_bytes();
+    let owner = f.owner.public_key().to_bytes();
+
+    for visibility in ["open", "private"] {
+        let mut tx = admitted(&f.pool, f.community).await.unwrap();
+        sqlx::query(
+            "UPDATE channels SET channel_type = 'system', visibility = $3::channel_visibility \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(f.community.as_uuid())
+        .bind(f.channel)
+        .bind(visibility)
+        .execute(tx.conn())
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert!(
+            crate::channel_members::get_readable_system_channel_ids(&f.pool, f.community, &bot)
+                .await
+                .unwrap()
+                .contains(&f.channel)
+        );
+
+        // Retain the bot's membership and global assignment while its owner leaves.
+        let mut tx = admitted(&f.pool, f.community).await.unwrap();
+        sqlx::query(
+            "UPDATE channel_members SET removed_at = NOW() \
+             WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3",
+        )
+        .bind(f.community.as_uuid())
+        .bind(f.channel)
+        .bind(owner.as_slice())
+        .execute(tx.conn())
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            access_status(&f.pool, f.community, &bot, None).await.unwrap(),
+            Some(true)
+        );
+        assert!(
+            !crate::channel_members::get_readable_system_channel_ids(&f.pool, f.community, &bot)
+                .await
+                .unwrap()
+                .contains(&f.channel)
+        );
+        // Ordinary members still read open system channels without joining them.
+        assert_eq!(
+            crate::channel_members::get_readable_system_channel_ids(&f.pool, f.community, &owner)
+                .await
+                .unwrap()
+                .contains(&f.channel),
+            visibility == "open"
+        );
+
+        let mut tx = admitted(&f.pool, f.community).await.unwrap();
+        sqlx::query(
+            "UPDATE channel_members SET removed_at = NULL \
+             WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3",
+        )
+        .bind(f.community.as_uuid())
+        .bind(f.channel)
+        .bind(owner.as_slice())
+        .execute(tx.conn())
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert!(
+            crate::channel_members::get_readable_system_channel_ids(&f.pool, f.community, &bot)
+                .await
+                .unwrap()
+                .contains(&f.channel)
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
 async fn assigned_access_owner_deactivation_ban_and_timeout_are_current() {
     let f = Fixture::new().await;
     f.apply(&f.command(false, 1, Uuid::new_v4())).await.unwrap();

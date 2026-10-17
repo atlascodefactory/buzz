@@ -1561,6 +1561,7 @@ pub async fn get_readable_system_channel_ids(
         SELECT c.id AS channel_id
         FROM channels c
         WHERE c.community_id = $1 AND c.deleted_at IS NULL AND c.channel_type = 'system'
+          AND assigned_bot_access_allowed($1, $2, c.id)
           AND (
             c.visibility = 'open'
             OR EXISTS (
