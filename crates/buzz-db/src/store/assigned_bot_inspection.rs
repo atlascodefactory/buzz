@@ -10,7 +10,7 @@ use super::*;
 /// statement snapshot. This is evidence for reconciliation, not an access grant
 /// or a promise that membership cannot change after the observation.
 pub async fn inspect_in_transaction(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut crate::AdmittedTx,
     command: &AssignedBotCommand,
 ) -> Result<serde_json::Value> {
     let AssignedBotOperation::Inspect { cursor, receipt } = command.operation() else {
@@ -18,6 +18,11 @@ pub async fn inspect_in_transaction(
             "expected assignment inspection".into(),
         ));
     };
+    if tx.community() != command.community() {
+        return Err(DbError::AccessDenied(
+            "assignment community mismatch".into(),
+        ));
+    }
     let community = command.community();
     let bot = command.bot().to_bytes();
     let owner = command.owner().to_bytes();
@@ -28,7 +33,7 @@ pub async fn inspect_in_transaction(
             "buzz_assigned_bot:{community}:{}",
             hex::encode(bot)
         ))
-        .execute(&mut **tx)
+        .execute(tx.conn())
         .await?;
     require_current_lifetime(tx, command).await?;
     // Expired signed commands can never be replayed. Bound cleanup work and keep
@@ -41,7 +46,7 @@ pub async fn inspect_in_transaction(
     )
     .bind(community.as_uuid())
     .bind(authority.as_slice())
-    .execute(&mut **tx)
+    .execute(tx.conn())
     .await?;
     let expires_at = i64::try_from(command.expires_at())
         .ok()
@@ -55,7 +60,7 @@ pub async fn inspect_in_transaction(
     .bind(authority.as_slice())
     .bind(command.nonce())
     .bind(expires_at)
-    .execute(&mut **tx)
+    .execute(tx.conn())
     .await?
     .rows_affected();
     if inserted != 1 {
@@ -121,7 +126,7 @@ pub async fn inspect_in_transaction(
     "#).bind(community.as_uuid()).bind(bot.as_slice()).bind(owner.as_slice())
         .bind(authority.as_slice()).bind(command.assignment_id()).bind(command.generation())
         .bind(cursor).bind(receipt.map(|id| id.to_bytes().to_vec()))
-        .fetch_one(&mut **tx).await?;
+        .fetch_one(tx.conn()).await?;
     if observation
         .get("coordinateMatch")
         .and_then(serde_json::Value::as_bool)

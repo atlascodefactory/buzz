@@ -1,0 +1,56 @@
+{
+  "upstreamRevision": "bf8b356f3bf551a01cc24041605ca77d009681dd",
+  "preservedAppliedMigrations": 56,
+  "mapping": [
+    {
+      "upstream": "migrations/0056_personal_read_state.sql",
+      "fork": "migrations/0057_personal_read_state.sql",
+      "sha256": "3bb996214650ea126fef43409a5556d63d9f43d2433af4a1809e927e4a113065"
+    },
+    {
+      "upstream": "migrations/0057_personal_read_started_at.sql",
+      "fork": "migrations/0058_personal_read_started_at.sql",
+      "sha256": "47316cbaf61e5df691b42110d27300a13201aa6ae182b6b9a8e9ea72ca71a56e"
+    },
+    {
+      "upstream": "migrations/0058_personal_read_through_message.sql",
+      "fork": "migrations/0059_personal_read_through_message.sql",
+      "sha256": "ba6520d32e1d3117df3a615ce8d84f72d3e05ea3d3875391d37a40385d50426a"
+    },
+    {
+      "upstream": "migrations/0059_push_rollback_gate.sql",
+      "fork": "migrations/0060_push_rollback_gate.sql",
+      "sha256": "5237efcf10334d1acb9f26b9852e40c2ddb4cace989739229e3d7221140d8f2d"
+    },
+    {
+      "upstream": "migrations/0060_push_single_application.sql",
+      "fork": "migrations/0061_push_single_application.sql",
+      "sha256": "e79c5285661447b99cb9ee1822fb633b6bcf2500f80b32aa051cc241e2a8a792"
+    },
+    {
+      "upstream": "migrations/0061_channel_labels.sql",
+      "fork": "migrations/0062_channel_labels.sql",
+      "sha256": "26e309cebf8cdf7af9234792745a3bce2717c0bc9aa46c301f451b7b0bb68e2d"
+    },
+    {
+      "upstream": "migrations/0062_system_channel_type.sql",
+      "fork": "migrations/0063_system_channel_type.sql",
+      "sha256": "25320b6cca8e039a8f243f2bb97fd87940921c70a5aeafd8babef509454461ca"
+    },
+    {
+      "upstream": "migrations/0063_retire_push_match_trigger.sql",
+      "fork": "migrations/0064_retire_push_match_trigger.sql",
+      "sha256": "a8495d01f12a6614cb940f678ef21523b13e76f20b01ffc0f7f9a2220548af98"
+    },
+    {
+      "upstream": "migrations/0064_profile_name_fields.sql",
+      "fork": "migrations/0065_profile_name_fields.sql",
+      "sha256": "6010003cbc966663a0a4845fc4e00b3ebe4d76df80f2660806eaf2f3ef8e107e"
+    },
+    {
+      "upstream": "migrations/0065_retire_channel_ttl_trigger.sql",
+      "fork": "migrations/0066_retire_channel_ttl_trigger.sql",
+      "sha256": "d410797982adfcc6763cfb496e775c6921da1b862d0d3b082b45e4b7c69a91ae"
+    }
+  ]
+}

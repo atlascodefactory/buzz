@@ -95,6 +95,8 @@ pub const EXPECTED_SCOPED_TABLES: &[&str] = &[
     "moderation_actions",
     "moderation_reports",
     "parameterized_event_watermarks",
+    "personal_read_accounts",
+    "personal_read_frontiers",
     "pubkey_allowlist",
     "push_leases",
     "push_match_queue",
@@ -111,11 +113,27 @@ pub const EXPECTED_SCOPED_TABLES: &[&str] = &[
     "workflows",
 ];
 
+/// Control-plane tables with community provenance that the tenant purge does
+/// not own. Keep this list separate from the expected tenant table manifest so
+/// catalog validation still detects newly introduced tenant tables.
+const EXCLUDED_SCOPED_TABLES: &[&str] = &[
+    "community_deletion_requests",
+    "community_deletion_approvals",
+    "community_deletion_checkpoints",
+    "community_serving_write_leases",
+    "community_deletion_executor_heartbeats",
+    "product_feedback",
+    "rate_limit_violations",
+    "operator_listener_outbox",
+];
+
 /// Foreign-key-safe child-before-parent order for the PostgreSQL purge.
 pub const PURGE_SCOPED_TABLES: &[&str] = &[
     "assigned_bot_commands",
     "assigned_bot_inspections",
     "assigned_bots",
+    "personal_read_frontiers",
+    "personal_read_accounts",
     "workflow_approvals",
     "scheduled_workflow_fires",
     "workflow_runs",
@@ -372,7 +390,9 @@ pub struct SchemaManifest {
     pub scoped_tables: Vec<String>,
     /// Per-table row counts for the target.
     pub row_counts: BTreeMap<String, i64>,
-    /// Sorted tables with the universal write-fence trigger.
+    /// Legacy fence snapshot retained for existing frozen inventory digests.
+    /// Populated from the live catalog while mixed-version executors need it.
+    #[serde(default)]
     pub fenced_tables: Vec<String>,
 }
 
@@ -1175,30 +1195,8 @@ impl DeletionStore {
             )));
         }
 
-        let required_fences = EXPECTED_SCOPED_TABLES
-            .iter()
-            .copied()
-            .map(str::to_owned)
-            .collect::<BTreeSet<_>>();
-        let live_fences = live_fenced_tables_on(&mut *conn).await?;
-        let missing_fences = required_fences
-            .difference(&live_fences)
-            .cloned()
-            .collect::<Vec<_>>();
-        if !missing_fences.is_empty() {
-            return Err(DbError::DeletionSafety(format!(
-                "community serving write fences missing: {}",
-                missing_fences.join(",")
-            )));
-        }
-
         let required_objects_present: bool = sqlx::query_scalar(
             "SELECT to_regprocedure('community_deletion_lock_key(uuid)') IS NOT NULL \
-                AND to_regprocedure('community_write_allowed(uuid)') IS NOT NULL \
-                AND (SELECT provolatile = 'v' FROM pg_proc \
-                     WHERE oid = 'community_write_allowed(uuid)'::regprocedure) \
-                AND to_regprocedure('assert_community_write_allowed(uuid)') IS NOT NULL \
-                AND to_regprocedure('enforce_community_write_fence()') IS NOT NULL \
                 AND EXISTS (SELECT 1 FROM pg_trigger t \
                     JOIN pg_class c ON c.oid = t.tgrelid \
                     JOIN pg_proc p ON p.oid = t.tgfoid \
@@ -1210,15 +1208,15 @@ impl DeletionStore {
         .await?;
         if !required_objects_present {
             return Err(DbError::DeletionSafety(
-                "community serving fence functions or tombstone trigger are missing".to_string(),
+                "community deletion lock function or tombstone trigger is missing".to_string(),
             ));
         }
         Ok(())
     }
 
-    /// Validate the exact live scoped-table and write-fence catalog for destruction.
+    /// Validate the exact live scoped-table catalog for destruction.
     ///
-    /// Exact table and fence equality rejects unknown tenant data even
+    /// Exact table equality rejects unknown tenant data even
     /// while unrelated SQLx migrations continue to advance. This pool-based
     /// check is an early rejection only; destructive transactions revalidate
     /// on their own connection under [`SCHEMA_DESTRUCTION_LOCK_KEY`].
@@ -2957,27 +2955,14 @@ impl DeletionStore {
     }
 
     /// Take the shared community deletion lock inside an existing transaction.
+    ///
+    /// See [`guard_community_write`].
     pub async fn guard_transaction(
         &self,
         tx: &mut Transaction<'_, Postgres>,
         community: CommunityId,
     ) -> Result<()> {
-        lock_community_deletion_shared(tx, community).await?;
-        let state: Option<String> = sqlx::query_scalar(
-            "SELECT deletion_state FROM communities WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(community.as_uuid())
-        .fetch_optional(&mut **tx)
-        .await?;
-        match state.as_deref() {
-            Some("active") => Ok(()),
-            Some(other) => Err(DbError::AccessDenied(format!(
-                "community {community} is write-fenced ({other})"
-            ))),
-            None => Err(DbError::AccessDenied(format!(
-                "community {community} is missing or tombstoned"
-            ))),
-        }
+        guard_community_write(tx, community).await
     }
 
     /// Take the shared community deletion lock inside an existing transaction
@@ -3077,24 +3062,10 @@ impl DeletionStore {
         let lease_seconds = i64::try_from(lease_duration.as_secs()).unwrap_or(i64::MAX);
         self.bounded_serving_lease_sql(SERVING_WRITE_LEASE_SQL_TIMEOUT, async |connection| {
             let mut tx = serving_lease_transaction(connection).await?;
-            // The assertion owns both the shared ordering lock and the supported
-            // READ COMMITTED check. The lease table is trigger-excluded, so this
-            // explicit admission is its database-enforced write fence.
-            if let Err(error) = sqlx::query("SELECT assert_community_write_allowed($1)")
-                .bind(community.as_uuid())
-                .execute(&mut *tx)
-                .await
-            {
-                if error.as_database_error().is_some_and(|database_error| {
-                    database_error.code().as_deref() == Some("55000")
-                        && database_error.message().starts_with("community write")
-                }) {
-                    return Err(DbError::AccessDenied(format!(
-                        "community {community} is write-fenced or missing"
-                    )));
-                }
-                return Err(error.into());
-            }
+            // Admit under the same shared lock as ordinary serving writes.
+            // The lease INSERT remains in this transaction and rechecks active
+            // state after admission, so a fence cannot interleave.
+            guard_community_write(&mut tx, community).await?;
             let row = sqlx::query(
                 "INSERT INTO community_serving_write_leases \
              (community_id, operation, owner, fence_generation, lease_until) \
@@ -3344,17 +3315,65 @@ async fn lock_community_deletion(
     Ok(())
 }
 
+/// Admit a community write inside an existing transaction.
+///
+/// Takes the shared community deletion lock, then requires the community to
+/// be `active` and not tombstoned. Refusal is [`DbError::AccessDenied`];
+/// a lock timeout surfaces as the underlying `55P03` database error. The
+/// lock is transaction-scoped, so commit, rollback, or a dropped transaction
+/// releases it. Crates outside `buzz-db` that own their own transactions
+/// (the audit chain) admit through this function.
+pub async fn guard_community_write(
+    tx: &mut Transaction<'_, Postgres>,
+    community: CommunityId,
+) -> Result<()> {
+    lock_community_deletion_shared(tx, community).await?;
+    let state: Option<String> = sqlx::query_scalar(
+        "SELECT deletion_state FROM communities WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(community.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await?;
+    match state.as_deref() {
+        Some("active") => Ok(()),
+        Some(other) => Err(DbError::AccessDenied(format!(
+            "community {community} is write-fenced ({other})"
+        ))),
+        None => Err(DbError::AccessDenied(format!(
+            "community {community} is missing or tombstoned"
+        ))),
+    }
+}
+
+/// Take the shared community deletion lock before an admission read.
+///
+/// Every caller reads lifecycle state after this returns, so the transaction
+/// must be READ COMMITTED: the lock statement may pin a snapshot under
+/// REPEATABLE READ/SERIALIZABLE, and a later state read would then miss a
+/// fence committed while this transaction waited for the lock. The isolation
+/// level is read in the same statement as the lock and refused as
+/// [`DbError::AccessDenied`].
 pub(crate) async fn lock_community_deletion_shared(
     tx: &mut Transaction<'_, Postgres>,
     community: CommunityId,
 ) -> Result<()> {
-    crate::observability::observe_advisory_lock(
+    let (_, isolation): ((), String) = crate::observability::observe_advisory_lock(
         crate::observability::LockType::Deletion,
-        sqlx::query("SELECT pg_advisory_xact_lock_shared(community_deletion_lock_key($1))")
-            .bind(community.as_uuid())
-            .execute(&mut **tx),
+        sqlx::query_as(
+            "SELECT pg_advisory_xact_lock_shared(community_deletion_lock_key($1)), \
+             current_setting('transaction_isolation')",
+        )
+        .bind(community.as_uuid())
+        .fetch_one(&mut **tx),
     )
     .await?;
+    if isolation != "read committed" {
+        tracing::error!(%isolation, %community, "deletion-lock admission requires read committed isolation");
+        // AccessDenied deliberately refuses writes; the log distinguishes config errors from fences.
+        return Err(DbError::AccessDenied(format!(
+            "deletion-lock admission requires read committed isolation, got {isolation}"
+        )));
+    }
     Ok(())
 }
 
@@ -3404,22 +3423,6 @@ async fn validate_catalog_on(conn: &mut PgConnection) -> Result<()> {
         )));
     }
 
-    let fenced_tables = live_fenced_tables_on(conn).await?;
-    if fenced_tables != expected {
-        let missing = expected
-            .difference(&fenced_tables)
-            .cloned()
-            .collect::<Vec<_>>();
-        let unknown = fenced_tables
-            .difference(&expected)
-            .cloned()
-            .collect::<Vec<_>>();
-        return Err(DbError::DeletionSafety(format!(
-            "community deletion write-fence drift (missing={}, unknown={})",
-            missing.join(","),
-            unknown.join(",")
-        )));
-    }
     Ok(())
 }
 
@@ -3435,10 +3438,11 @@ async fn live_scoped_tables_on(conn: &mut PgConnection) -> Result<BTreeSet<Strin
           AND NOT c.relispartition
           AND a.attname = 'community_id'
           AND NOT a.attisdropped
-          AND NOT community_write_fence_excluded_table(c.relname)
+          AND c.relname != ALL($1)
         ORDER BY c.relname
         "#,
     )
+    .bind(EXCLUDED_SCOPED_TABLES)
     .fetch_all(conn)
     .await?;
     Ok(rows.into_iter().collect())
@@ -3896,6 +3900,24 @@ fn bound_text(input: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_table_exclusions_match_sql_during_transition() {
+        let sql =
+            include_str!("../../../../schema/functions/community_write_fence_excluded_table.sql");
+        let sql_names = sql
+            .split("ARRAY[")
+            .nth(1)
+            .expect("SQL exclusion array")
+            .split(']')
+            .next()
+            .expect("SQL exclusion names")
+            .split(',')
+            .map(|name| name.trim().trim_matches('\''))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(sql_names.len(), 8);
+        assert_eq!(sql_names, EXCLUDED_SCOPED_TABLES.iter().copied().collect());
+    }
 
     fn empty_prefix(prefix: &str) -> PrefixManifest {
         PrefixManifest {
@@ -4364,6 +4386,141 @@ mod postgres_tests {
         }
         let store = db.deletion_store();
         (db, store)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn migration_schema_fence_objects_are_optional_for_serving_and_deletion() {
+        let db = Db::new(&DbConfig {
+            database_url: crate::test_support::database_url(),
+            max_connections: 5,
+            min_connections: 0,
+            ..DbConfig::default()
+        })
+        .await
+        .expect("connect isolated migration DB");
+        crate::migration::run_migrations_through(&db.pool, 60)
+            .await
+            .expect("migrate with fence objects present");
+        let store = db.deletion_store();
+        let community = db
+            .ensure_configured_community("optional-fences.example")
+            .await
+            .expect("community")
+            .id;
+        for objects_present in [true, false] {
+            if !objects_present {
+                // Drop the fence objects by hand, as the retirement migration
+                // will; this change itself ships no schema changes.
+                sqlx::raw_sql(r#"
+DROP TRIGGER IF EXISTS community_write_fence_api_tokens ON api_tokens;
+DROP TRIGGER IF EXISTS community_write_fence_archived_identities ON archived_identities;
+DROP TRIGGER IF EXISTS community_write_fence_artifact_heads ON artifact_heads;
+DROP TRIGGER IF EXISTS community_write_fence_artifact_revisions ON artifact_revisions;
+DROP TRIGGER IF EXISTS community_write_fence_audit_log ON audit_log;
+DROP TRIGGER IF EXISTS community_write_fence_channel_members ON channel_members;
+DROP TRIGGER IF EXISTS community_write_fence_channels ON channels;
+DROP TRIGGER IF EXISTS community_write_fence_community_bans ON community_bans;
+DROP TRIGGER IF EXISTS community_write_fence_delivery_log ON delivery_log;
+DROP TRIGGER IF EXISTS community_write_fence_event_mentions ON event_mentions;
+DROP TRIGGER IF EXISTS community_write_fence_events ON events;
+DROP TRIGGER IF EXISTS community_write_fence_git_repo_names ON git_repo_names;
+DROP TRIGGER IF EXISTS community_write_fence_join_policy_acceptances ON join_policy_acceptances;
+DROP TRIGGER IF EXISTS community_write_fence_moderation_actions ON moderation_actions;
+DROP TRIGGER IF EXISTS community_write_fence_moderation_reports ON moderation_reports;
+DROP TRIGGER IF EXISTS community_write_fence_parameterized_event_watermarks ON parameterized_event_watermarks;
+DROP TRIGGER IF EXISTS community_write_fence_personal_read_accounts ON personal_read_accounts;
+DROP TRIGGER IF EXISTS community_write_fence_personal_read_frontiers ON personal_read_frontiers;
+DROP TRIGGER IF EXISTS community_write_fence_pubkey_allowlist ON pubkey_allowlist;
+DROP TRIGGER IF EXISTS community_write_fence_push_leases ON push_leases;
+DROP TRIGGER IF EXISTS community_write_fence_push_match_queue ON push_match_queue;
+DROP TRIGGER IF EXISTS community_write_fence_push_wake_outbox ON push_wake_outbox;
+DROP TRIGGER IF EXISTS community_write_fence_reactions ON reactions;
+DROP TRIGGER IF EXISTS community_write_fence_relay_invites ON relay_invites;
+DROP TRIGGER IF EXISTS community_write_fence_relay_members ON relay_members;
+DROP TRIGGER IF EXISTS community_write_fence_scheduled_workflow_fires ON scheduled_workflow_fires;
+DROP TRIGGER IF EXISTS community_write_fence_subscriptions ON subscriptions;
+DROP TRIGGER IF EXISTS community_write_fence_thread_metadata ON thread_metadata;
+DROP TRIGGER IF EXISTS community_write_fence_users ON users;
+DROP TRIGGER IF EXISTS community_write_fence_workflow_approvals ON workflow_approvals;
+DROP TRIGGER IF EXISTS community_write_fence_workflow_runs ON workflow_runs;
+DROP TRIGGER IF EXISTS community_write_fence_workflows ON workflows;
+
+DROP FUNCTION attach_community_write_fence(REGCLASS);
+DROP FUNCTION enforce_community_write_fence();
+DROP FUNCTION assert_community_write_allowed(UUID);
+DROP FUNCTION community_write_allowed(UUID);
+DROP FUNCTION community_write_fence_excluded_table(NAME);
+
+                "#)
+                .execute(&db.pool)
+                .await
+                .expect("retire only universal fence objects");
+            }
+            store
+                .validate_serving_catalog()
+                .await
+                .expect("serving startup");
+            db.validate_deletion_serving_catalog_for_readiness(
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .expect("readiness");
+            store.validate_catalog().await.expect("deletion catalog");
+            let inventory = store.inventory_schema(community).await.expect("inventory");
+            assert_eq!(inventory.scoped_tables.len(), EXPECTED_SCOPED_TABLES.len());
+            assert_eq!(
+                inventory.fenced_tables.len(),
+                if objects_present {
+                    EXPECTED_SCOPED_TABLES.len()
+                } else {
+                    0
+                }
+            );
+            let lease = store
+                .acquire_serving_write_lease(
+                    community,
+                    "optional_fences",
+                    "test-owner",
+                    DEFAULT_LEASE_DURATION,
+                )
+                .await
+                .expect("active serving lease");
+            store
+                .release_serving_write_lease(&lease)
+                .await
+                .expect("release lease");
+            for state in ["quiescing", "fenced", "tombstone"] {
+                crate::test_support::set_deletion_state(&db.pool, *community.as_uuid(), state)
+                    .await;
+                assert!(
+                    matches!(
+                        store
+                            .acquire_serving_write_lease(
+                                community,
+                                "denied",
+                                "test-owner",
+                                DEFAULT_LEASE_DURATION
+                            )
+                            .await,
+                        Err(DbError::AccessDenied(_))
+                    ),
+                    "{state} must map to AccessDenied with objects_present={objects_present}"
+                );
+            }
+            assert!(matches!(
+                store
+                    .acquire_serving_write_lease(
+                        CommunityId::from_uuid(Uuid::new_v4()),
+                        "missing",
+                        "test-owner",
+                        DEFAULT_LEASE_DURATION
+                    )
+                    .await,
+                Err(DbError::AccessDenied(_))
+            ));
+            crate::test_support::set_deletion_state(&db.pool, *community.as_uuid(), "active").await;
+        }
     }
 
     fn empty_prefix_manifest(prefix: String) -> PrefixManifest {
@@ -6289,17 +6446,27 @@ mod postgres_tests {
             mismatched_approval.is_err(),
             "approval digest must remain database-bound to the frozen request digest"
         );
+        // PostgreSQL sends this rejection before it rolls the statement back
+        // and releases the request row lock, and sqlx returns on the error.
+        // The claim below uses SKIP LOCKED on another pooled connection, so
+        // finish a round trip on this connection before claiming.
+        let mut tamper_conn = db.pool.acquire().await.expect("acquire tamper connection");
         let mismatched_request = sqlx::query(
             "UPDATE community_deletion_requests SET inventory_digest = $2 WHERE id = $1",
         )
         .bind(request.id)
         .bind(vec![1_u8; 32])
-        .execute(&db.pool)
+        .execute(&mut *tamper_conn)
         .await;
         assert!(
             mismatched_request.is_err(),
             "the frozen request digest must remain bound to its approval"
         );
+        sqlx::query("SELECT 1")
+            .execute(&mut *tamper_conn)
+            .await
+            .expect("rejected update has rolled back");
+        drop(tamper_conn);
         assert!(store
             .claim_specific(request.id, "executor-a", DEFAULT_LEASE_DURATION)
             .await
@@ -6878,7 +7045,7 @@ mod postgres_tests {
             .id;
 
         let writer = db
-            .begin_community_write_transaction(community)
+            .begin_event_write_transaction(community)
             .await
             .expect("open writer transaction with community lock");
 
@@ -6939,7 +7106,7 @@ mod postgres_tests {
         store.fence(&claim.lease).await.expect("fence");
 
         let error = db
-            .begin_community_write_transaction(request.community_id)
+            .begin_event_write_transaction(request.community_id)
             .await
             .expect_err("fenced community must reject fresh write admission");
         assert!(
@@ -6978,7 +7145,7 @@ mod postgres_tests {
         );
 
         let mut admitted_writer = db
-            .begin_community_write_transaction(request.community_id)
+            .begin_event_write_transaction(request.community_id)
             .await
             .expect("open admitted writer");
         let updated = sqlx::query(
@@ -6987,7 +7154,7 @@ mod postgres_tests {
         .bind(request.community_id.as_uuid())
         .bind(pubkey.to_vec())
         .bind("during")
-        .execute(&mut *admitted_writer)
+        .execute(admitted_writer.conn())
         .await
         .expect("update allowlist note")
         .rows_affected();
@@ -7028,10 +7195,9 @@ mod postgres_tests {
             .expect("claim")
             .expect("won claim");
 
-        let mut open_write = db
-            .begin_event_write_transaction()
-            .await
-            .expect("open write transaction");
+        // A raw writer transaction on purpose: this pins that the fenced-table
+        // trigger itself takes the shared deletion lock, not the chokepoint.
+        let mut open_write = db.pool.begin().await.expect("open write transaction");
         sqlx::query("INSERT INTO pubkey_allowlist (community_id, pubkey) VALUES ($1, $2)")
             .bind(request.community_id.as_uuid())
             .bind(vec![7_u8; 32])
@@ -7066,8 +7232,8 @@ mod postgres_tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
-    async fn write_assertion_rejects_pinned_snapshot_isolation_before_authorization() {
-        let (db, _) = store().await;
+    async fn deletion_lock_admission_rejects_pinned_snapshot_isolation() {
+        let (db, store) = store().await;
         let community = db
             .ensure_configured_community(&format!(
                 "isolation-guard-{}.example",
@@ -7076,35 +7242,44 @@ mod postgres_tests {
             .await
             .expect("create community")
             .id;
+        // Never acquired: under READ COMMITTED this lease is refused as stale,
+        // so a stale-lease error here means the isolation check did not run.
+        let lease = ServingWriteLease {
+            id: Uuid::new_v4(),
+            community_id: community,
+            operation: "isolation-probe".to_owned(),
+            owner: "isolation-probe".to_owned(),
+            generation: 0,
+            fence_generation: 0,
+            lease_until: Utc::now(),
+        };
 
         for isolation in ["REPEATABLE READ", "SERIALIZABLE"] {
-            let mut tx = db.pool.begin().await.expect("begin isolation probe");
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "SET TRANSACTION ISOLATION LEVEL {isolation}"
-            )))
-            .execute(&mut *tx)
-            .await
-            .expect("set transaction isolation");
-            sqlx::query(
-                "SELECT set_config('buzz.deletion_executor_community', $1, true), \
-                        set_config('buzz.deletion_fence_generation', '0', true)",
-            )
-            .bind(community.to_string())
-            .execute(&mut *tx)
-            .await
-            .expect("forge executor authorization");
-            let error = sqlx::query("SELECT assert_community_write_allowed($1)")
-                .bind(community.as_uuid())
+            for path in [
+                "guard_community_write",
+                "guard_transaction_with_serving_lease",
+            ] {
+                let mut tx = db.pool.begin().await.expect("begin isolation probe");
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "SET TRANSACTION ISOLATION LEVEL {isolation}"
+                )))
                 .execute(&mut *tx)
                 .await
-                .expect_err("pinned snapshot isolation must fail before authorization");
-            assert_eq!(
-                error
-                    .as_database_error()
-                    .and_then(|error| error.code())
-                    .as_deref(),
-                Some("25000")
-            );
+                .expect("set transaction isolation");
+                let error = match path {
+                    "guard_community_write" => guard_community_write(&mut tx, community).await,
+                    _ => {
+                        store
+                            .guard_transaction_with_serving_lease(&mut tx, &lease)
+                            .await
+                    }
+                }
+                .expect_err("pinned snapshot isolation must be refused");
+                assert!(
+                    matches!(&error, DbError::AccessDenied(message) if message.contains("requires read committed")),
+                    "{path} under {isolation}: {error:?}"
+                );
+            }
         }
     }
 
@@ -7184,6 +7359,80 @@ mod postgres_tests {
             Some("57014"),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn serving_lease_acquire_waits_for_fence_lock_then_refuses() {
+        let db = Db::new(&DbConfig {
+            database_url: crate::test_support::database_url(),
+            max_connections: 5,
+            min_connections: 0,
+            ..DbConfig::default()
+        })
+        .await
+        .expect("connect isolated test DB");
+        let community = db
+            .ensure_configured_community("lease-fence-lock.example")
+            .await
+            .expect("active community")
+            .id;
+        let mut fence_tx = db.pool.begin().await.expect("begin fence transaction");
+        sqlx::query("SELECT pg_advisory_xact_lock(community_deletion_lock_key($1))")
+            .bind(community.as_uuid())
+            .execute(&mut *fence_tx)
+            .await
+            .expect("hold exclusive deletion lock");
+
+        let store = db.deletion_store();
+        let mut acquisition = tokio::spawn(async move {
+            store
+                .acquire_serving_write_lease(
+                    community,
+                    "fence_lock_test",
+                    "test-owner",
+                    DEFAULT_LEASE_DURATION,
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut acquisition)
+                .await
+                .is_err(),
+            "lease acquisition must wait for the exclusive deletion lock"
+        );
+
+        sqlx::query(
+            "SELECT set_config('buzz.deletion_executor_community', $1, true), \
+                    set_config('buzz.deletion_fence_generation', \
+                        (SELECT deletion_fence_generation::text FROM communities WHERE id = $2), true)",
+        )
+        .bind(community.to_string())
+        .bind(community.as_uuid())
+        .execute(&mut *fence_tx)
+        .await
+        .expect("authorize fence transition");
+        sqlx::query("UPDATE communities SET deletion_state = 'fenced' WHERE id = $1")
+            .bind(community.as_uuid())
+            .execute(&mut *fence_tx)
+            .await
+            .expect("fence community while holding the lock");
+        fence_tx.commit().await.expect("commit fence");
+
+        let error = tokio::time::timeout(Duration::from_secs(5), acquisition)
+            .await
+            .expect("acquisition completes after fence commit")
+            .expect("acquisition task")
+            .expect_err("fenced community refuses a new lease");
+        assert!(matches!(error, DbError::AccessDenied(_)), "{error:?}");
+        let leases: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM community_serving_write_leases WHERE community_id = $1",
+        )
+        .bind(community.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("count serving leases");
+        assert_eq!(leases, 0, "refused acquisition must not persist a lease");
     }
 
     #[tokio::test]
@@ -8072,10 +8321,7 @@ mod postgres_tests {
         let (base_prefix, _) = base_url.rsplit_once('/').expect("database url has a path");
         let probe_url = format!("{base_prefix}/{probe_db}");
 
-        let schema_sql = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../schema/schema.sql"),
-        )
-        .expect("read schema/schema.sql");
+        let schema_sql = crate::test_support::desired_state_schema_sql();
         let bootstrap = PgPool::connect(&probe_url)
             .await
             .expect("connect probe database");

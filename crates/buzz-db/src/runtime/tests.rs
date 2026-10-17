@@ -77,8 +77,35 @@ async fn setup_db() -> Db {
     Db::from_pool(pool)
 }
 
+/// A pool that becomes unavailable after the candidate read must end the
+/// sweep at the first tenant, not cost one acquire attempt per tenant.
 #[tokio::test]
-async fn begin_transaction_compatibility_alias_is_preserved() {
+async fn fleet_sweep_stops_at_first_unavailable_connection() {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy(&crate::test_support::database_url())
+        .expect("construct lazy sweep pool");
+    pool.close().await;
+    let attempted = std::cell::Cell::new(0);
+    let candidates = (0..3).map(|_| {
+        attempted.set(attempted.get() + 1);
+        Uuid::new_v4()
+    });
+
+    let committed = sweep_admitted_communities(
+        &pool,
+        candidates,
+        observability::WriterOperation::Maintenance,
+        "test_sweep",
+        |_, _| async { Ok(()) },
+    )
+    .await;
+
+    assert!(committed.is_empty());
+    assert_eq!(attempted.get(), 1, "sweep must stop after the outage");
+}
+
+#[tokio::test]
+async fn event_write_transaction_preserves_legacy_acquisition_metrics() {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
     let pool = sqlx::postgres::PgPoolOptions::new()
@@ -90,8 +117,9 @@ async fn begin_transaction_compatibility_alias_is_preserved() {
     let snapshotter = recorder.snapshotter();
     let _guard = metrics::set_default_local_recorder(&recorder);
 
-    #[allow(deprecated)]
-    let result = db.begin_transaction().await;
+    let result = db
+        .begin_event_write_transaction(CommunityId::from_uuid(Uuid::new_v4()))
+        .await;
     assert!(matches!(
         result,
         Err(DbError::Sqlx(sqlx::Error::PoolClosed))
@@ -167,6 +195,69 @@ fn nip43_reconciliation_compatibility_alias_is_preserved() {
     }
 
     let _ = call;
+}
+
+#[tokio::test]
+async fn community_write_transaction_compatibility_metrics_are_limited_to_legacy_entrypoints() {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy(&crate::test_support::database_url())
+        .expect("construct lazy compatibility pool");
+    pool.close().await;
+    let db = Db::from_pool(pool);
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let community = CommunityId::from_uuid(Uuid::new_v4());
+
+    let direct = begin_community_event_write_transaction(
+        &db.pool,
+        community,
+        observability::WriterOperation::EventWrite,
+    )
+    .await;
+    assert!(matches!(
+        direct,
+        Err(DbError::Sqlx(sqlx::Error::PoolClosed))
+    ));
+    assert_eq!(
+        legacy_acquisition_count(&snapshotter.snapshot().into_vec()),
+        0,
+        "typed-only tenant-local chokepoint must not emit legacy compatibility metrics"
+    );
+
+    let legacy = db.begin_event_write_transaction(community).await;
+    assert!(matches!(
+        legacy,
+        Err(DbError::Sqlx(sqlx::Error::PoolClosed))
+    ));
+    assert_eq!(
+        legacy_acquisition_count(&snapshotter.snapshot().into_vec()),
+        1,
+        "Db::begin_event_write_transaction must preserve the legacy compatibility population"
+    );
+}
+
+fn legacy_acquisition_count(
+    snapshot: &[(
+        metrics_util::CompositeKey,
+        Option<metrics::Unit>,
+        Option<metrics::SharedString>,
+        metrics_util::debugging::DebugValue,
+    )],
+) -> u64 {
+    snapshot
+        .iter()
+        .filter_map(|(key, _, _, value)| {
+            (key.key().name() == "buzz_db_pool_acquisitions_total")
+                .then_some(value)
+                .map(|value| match value {
+                    metrics_util::debugging::DebugValue::Counter(value) => *value,
+                    _ => panic!("legacy acquisitions must be a counter"),
+                })
+        })
+        .sum()
 }
 
 #[tokio::test]
@@ -759,9 +850,9 @@ async fn push_gateway_profile_migration_converges_brownfield_authority() {
     .await
     .expect("insert delegation for legacy installation");
 
-    migration::run_migrations(&pool)
+    migration::run_migrations_through(&pool, 43)
         .await
-        .expect("apply dogfood-only migration");
+        .expect("apply historical profile migration");
 
     let legacy_installations: i64 =
         sqlx::query_scalar("SELECT count(*) FROM push_gateway_installations")
@@ -814,6 +905,10 @@ async fn push_gateway_profile_migration_converges_brownfield_authority() {
 
 /// Insert identical community + channel rows into a database so the same
 /// (community, channel) ids resolve in both writer and replica.
+///
+/// Raw SQL with only columns from the initial schema: some callers seed a
+/// scratch database migrated to an older version, which lacks columns that
+/// the current channel store writes (for example `labels`).
 async fn seed_community_channel(
     pool: &PgPool,
     community: Uuid,
@@ -826,19 +921,28 @@ async fn seed_community_channel(
         .execute(pool)
         .await
         .expect("insert community");
-    crate::channel::create_channel_with_id(
-        pool,
-        CommunityId::from_uuid(community),
-        channel,
-        &format!("replica-routing-{channel}"),
-        crate::channel::ChannelType::Stream,
-        crate::channel::ChannelVisibility::Open,
-        None,
-        author.public_key().to_bytes().as_slice(),
-        None,
+    let author = author.public_key().to_bytes();
+    sqlx::query(
+        "INSERT INTO channels (id, community_id, name, channel_type, visibility, created_by) \
+         VALUES ($1, $2, $3, 'stream', 'open', $4)",
     )
+    .bind(channel)
+    .bind(community)
+    .bind(format!("replica-routing-{channel}"))
+    .bind(author.as_slice())
+    .execute(pool)
     .await
     .expect("create channel");
+    sqlx::query(
+        "INSERT INTO channel_members (community_id, channel_id, pubkey, role, invited_by) \
+         VALUES ($1, $2, $3, 'owner', $3)",
+    )
+    .bind(community)
+    .bind(channel)
+    .bind(author.as_slice())
+    .execute(pool)
+    .await
+    .expect("add channel owner");
 }
 
 fn signed_event_at(keys: &nostr::Keys, content: &str, secs: u64) -> nostr::Event {
@@ -3131,6 +3235,22 @@ async fn armed_pool_rejects_old_channel_inserts_through_public_api() {
     db.pool.close().await;
 }
 
+/// A writer transaction holding the shared replica-floor advisory lock, the
+/// shape a floor-compliant writer takes before the exclusive probe can run.
+async fn begin_replica_floor_locked_writer(db: &Db) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut tx = db
+        .pool
+        .begin()
+        .await
+        .expect("begin floor-guarded writer tx");
+    sqlx::query("SELECT pg_advisory_xact_lock_shared($1)")
+        .bind(crate::replica_fence::REPLICA_FLOOR_LOCK_KEY)
+        .execute(&mut *tx)
+        .await
+        .expect("take shared replica-floor lock");
+    tx
+}
+
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn replica_floor_writer_transaction_holds_shared_lock() {
@@ -3150,10 +3270,7 @@ async fn replica_floor_writer_transaction_holds_shared_lock() {
     .await
     .expect("connect armed Db");
 
-    let writer = db
-        .begin_replica_floor_locked_event_write_transaction()
-        .await
-        .expect("open compliant floor-guarded writer tx");
+    let writer = begin_replica_floor_locked_writer(&db).await;
 
     let mut shared_contender = db.pool.begin().await.expect("begin shared contender");
     let shared_taken: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock_shared($1)")
@@ -3214,10 +3331,7 @@ async fn replica_floor_probe_waits_for_shared_writer_and_records_after_release()
         .await
         .expect("read token before probe");
 
-    let writer = db
-        .begin_replica_floor_locked_event_write_transaction()
-        .await
-        .expect("open compliant floor-guarded writer tx");
+    let writer = begin_replica_floor_locked_writer(&db).await;
 
     let probe_pool = db.pool.clone();
     let probe_fence = std::sync::Arc::clone(db.fence());
@@ -3750,3 +3864,159 @@ async fn e_tag_any_runs_with_real_binds_on_p_join_and_count() {
 
 #[path = "tests/thread_window_postgres_tests.rs"]
 mod thread_window_postgres_tests;
+
+/// `insert_event_with_serving_write_guard` indexes mentions in the event's own
+/// transaction, and an indexing failure stays best-effort: the savepoint rolls
+/// back only the mention rows, never the event.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn serving_write_guard_insert_indexes_mentions_in_event_transaction() {
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+
+    let db = setup_db().await;
+    let community = db
+        .ensure_configured_community(&format!(
+            "serving-mentions-{}.example",
+            Uuid::new_v4().simple()
+        ))
+        .await
+        .expect("create serving-write mention community")
+        .id;
+    let store = db.deletion_store();
+    let lease = store
+        .acquire_serving_write_lease(
+            community,
+            "mention_index_test",
+            "mention-index-test",
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("acquire serving-write lease");
+    let mentioned = Keys::generate().public_key().to_hex();
+    let build = |content: &str| {
+        EventBuilder::new(Kind::TextNote, content)
+            .tags([Tag::parse(["p", mentioned.as_str()]).expect("p tag")])
+            .sign_with_keys(&Keys::generate())
+            .expect("sign event")
+    };
+    let counts = |event_id: Vec<u8>| {
+        let pool = db.pool.clone();
+        async move {
+            let live: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM events \
+                 WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL",
+            )
+            .bind(community.as_uuid())
+            .bind(&event_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count live events");
+            let mentions: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM event_mentions WHERE community_id = $1 AND event_id = $2",
+            )
+            .bind(community.as_uuid())
+            .bind(&event_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count mentions");
+            (live, mentions)
+        }
+    };
+
+    // Pin in-transaction indexing: the mention insert must run in the same
+    // top-level transaction that inserted the event row. A post-commit index
+    // runs in a later transaction, raises here, is logged as a warning, and
+    // leaves zero mentions.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION test_require_event_tx_mentions() RETURNS trigger AS $$ \
+         BEGIN \
+             IF NEW.community_id = '{}'::uuid AND NOT EXISTS ( \
+                 SELECT 1 FROM events \
+                 WHERE community_id = NEW.community_id AND id = NEW.event_id \
+                   AND xmin = pg_current_xact_id()::xid) THEN \
+                 RAISE EXCEPTION 'test: post-commit mention'; \
+             END IF; \
+             RETURN NEW; \
+         END; $$ LANGUAGE plpgsql",
+        community.as_uuid()
+    )))
+    .execute(&db.pool)
+    .await
+    .expect("create same-transaction mention function");
+    sqlx::query(
+        "CREATE TRIGGER trg_test_require_event_tx_mentions BEFORE INSERT ON event_mentions \
+         FOR EACH ROW EXECUTE FUNCTION test_require_event_tx_mentions()",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install same-transaction mention trigger");
+
+    let indexed = build("indexed");
+    let result = db
+        .insert_event_with_serving_write_guard(&lease, &indexed, None)
+        .await;
+
+    sqlx::query("DROP TRIGGER trg_test_require_event_tx_mentions ON event_mentions")
+        .execute(&db.pool)
+        .await
+        .expect("drop same-transaction mention trigger");
+    sqlx::query("DROP FUNCTION test_require_event_tx_mentions()")
+        .execute(&db.pool)
+        .await
+        .expect("drop same-transaction mention function");
+
+    let (_, inserted) = result.expect("guarded insert");
+    assert!(inserted);
+    assert_eq!(
+        counts(indexed.id.as_bytes().to_vec()).await,
+        (1, 1),
+        "mentions must be indexed in the event's own transaction"
+    );
+
+    // Make mention indexing fail for this community only. Without the
+    // savepoint the aborted statement poisons the event transaction and the
+    // commit fails.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION test_reject_mentions() RETURNS trigger AS $$ \
+         BEGIN \
+             IF NEW.community_id = '{}'::uuid THEN \
+                 RAISE EXCEPTION 'test: mention indexing rejected'; \
+             END IF; \
+             RETURN NEW; \
+         END; $$ LANGUAGE plpgsql",
+        community.as_uuid()
+    )))
+    .execute(&db.pool)
+    .await
+    .expect("create mention rejection function");
+    sqlx::query(
+        "CREATE TRIGGER trg_test_reject_mentions BEFORE INSERT ON event_mentions \
+         FOR EACH ROW EXECUTE FUNCTION test_reject_mentions()",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("install mention rejection trigger");
+
+    let rejected = build("mention indexing fails");
+    let result = db
+        .insert_event_with_serving_write_guard(&lease, &rejected, None)
+        .await;
+
+    sqlx::query("DROP TRIGGER trg_test_reject_mentions ON event_mentions")
+        .execute(&db.pool)
+        .await
+        .expect("drop mention rejection trigger");
+    sqlx::query("DROP FUNCTION test_reject_mentions()")
+        .execute(&db.pool)
+        .await
+        .expect("drop mention rejection function");
+
+    let (_, inserted) = result.expect("mention failure must not reject the event");
+    assert!(inserted);
+    assert_eq!(counts(rejected.id.as_bytes().to_vec()).await, (1, 0));
+
+    assert!(store
+        .release_serving_write_lease(&lease)
+        .await
+        .expect("release serving-write lease"));
+}

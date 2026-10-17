@@ -42,16 +42,17 @@ pub enum ConfigError {
 /// - `Moderator/Db` from the `relay_operators` table otherwise
 /// - `None` → 403 (no fall-through role, ever)
 ///
-/// Disabled mode is always read-only. NIP-98 mode is read-write per resolved
-/// principal.
+/// Disabled mode serves every moderation read and refuses writes and staffing.
+/// NIP-98 mode is read-write per resolved principal.
 #[derive(Debug, Clone)]
 pub enum AdminAuth {
     /// Authentication disabled. The operator has explicitly asserted
     /// that the admin API is protected at the network layer (reverse proxy,
     /// VPN, firewall). `Host`/`Origin` checks remain active as defense-in-depth.
     /// Selected by `BUZZ_ADMIN_AUTH=disabled`.
-    /// Always read-only: `authorize()` resolves no principal for this mode, so
-    /// mutation and staffing routes always 403.
+    /// Every moderation read is served to anyone who can reach the relay;
+    /// `authorize()` returns `NetworkTrusted` with no identity, so write and
+    /// staffing routes always 403.
     Disabled,
     /// NIP-98 HTTP Auth. Every request must carry an `Authorization: Nostr`
     /// header containing a signed kind-27235 event. The authenticated pubkey
@@ -63,8 +64,7 @@ pub enum AdminAuth {
 }
 
 /// Deny-by-default deployment-admin configuration. Mutation and staffing routes
-/// require a resolved principal (NIP-98 only); disabled mode is always
-/// read-only.
+/// require a resolved principal (NIP-98 only); disabled mode serves reads only.
 #[derive(Debug, Clone)]
 pub struct AdminConfig {
     /// Exact admin HTTP authority.
@@ -133,6 +133,10 @@ pub struct Config {
     /// `0` (the default) disables bounded-staleness replica routing; see
     /// [`buzz_db::DbConfig::replica_read_max_age_ms`].
     pub replica_read_max_age_ms: u64,
+    /// Replica freshness budget for fleet usage telemetry
+    /// (`BUZZ_USAGE_METRICS_REPLICA_MAX_AGE_MS`). Independent of serving-read
+    /// routing; defaults to 30 seconds and `0` disables telemetry DB queries.
+    pub usage_metrics_replica_max_age_ms: u64,
 
     /// Upper bound, in milliseconds, of the per-connection random delay applied
     /// when sending the `1012 Service Restart` close frame during graceful
@@ -187,6 +191,10 @@ pub struct Config {
     /// Whether REST API requests must present a valid token. Independent of
     /// WebSocket protocol auth, which is *always* required by REQ/EVENT/COUNT.
     pub require_auth_token: bool,
+    /// Opt-in private accessory API; disabled until explicitly deployed.
+    pub buzz_v1_enabled: bool,
+    /// Author-time unread tracking duration, independent of NIP-RS retention.
+    pub buzz_v1_retention_seconds: u32,
     /// Comma-separated list of allowed CORS origins.
     /// If empty, permissive CORS is used (dev mode).
     /// Example: "tauri://localhost,http://localhost:3000"
@@ -204,8 +212,13 @@ pub struct Config {
     pub metrics_port: u16,
     /// Interval between read-only partition catalog audits.
     pub partition_audit_interval: Duration,
-    /// Whether the partition manager may create uncovered monthly partitions.
+    /// Whether the partition manager may issue any partition DDL. Off also
+    /// disables catch-all advancement.
     pub partition_manager_create_enabled: bool,
+    /// Whether the partition manager may replace an empty right-edge catch-all
+    /// with dedicated monthlies. Also enables periodic (not only startup) DDL.
+    /// Requires `partition_manager_create_enabled`.
+    pub partition_manager_advance_enabled: bool,
 
     /// When true, NIP-42 pubkey-only authentication (no API token) is
     /// restricted to pubkeys in the `pubkey_allowlist` table. Users with valid
@@ -282,7 +295,7 @@ pub struct Config {
     /// skipped — a typo must not silently disable an operator.
     pub relay_operator_pubkeys: Vec<String>,
 
-    /// Configured operator-listener identities and their HTTPS delivery URLs.
+    /// Configured operator-listener identities and their HTTP(S) delivery URLs.
     pub operator_listener_delivery_urls: HashMap<String, url::Url>,
 
     /// Allow NIP-OA owner attestation for relay membership.
@@ -356,7 +369,7 @@ pub struct Config {
     /// Used to authenticate internal policy endpoint requests.
     pub git_hook_hmac_secret: String,
 
-    /// Whether NIP-PL push discovery, lease acceptance, matching, and delivery
+    /// Whether NIP-PL push discovery, lease acceptance, enqueueing, matching, and delivery
     /// are enabled for this deployment. Defaults to false.
     pub push_enabled: bool,
     /// Descriptor key identifier accepted in kind:30350 `exec` tags.
@@ -527,7 +540,7 @@ fn parse_operator_listener_delivery_urls(
                 "BUZZ_OPERATOR_LISTENERS endpoint is not a valid URL: {e}"
             ))
         })?;
-        if url.scheme() != "https"
+        if !matches!(url.scheme(), "http" | "https")
             || url.host().is_none()
             || !url.username().is_empty()
             || url.password().is_some()
@@ -535,7 +548,7 @@ fn parse_operator_listener_delivery_urls(
             || url.fragment().is_some()
         {
             return Err(ConfigError::InvalidValue(
-                "BUZZ_OPERATOR_LISTENERS endpoints must be HTTPS URLs without credentials, query, or fragment"
+                "BUZZ_OPERATOR_LISTENERS endpoints must be HTTP(S) URLs without credentials, query, or fragment"
                     .to_string(),
             ));
         }
@@ -655,6 +668,16 @@ impl Config {
             })?,
             Err(_) => 0,
         };
+        let usage_metrics_replica_max_age_ms =
+            match std::env::var("BUZZ_USAGE_METRICS_REPLICA_MAX_AGE_MS") {
+                Ok(raw) => raw.trim().parse::<u64>().map_err(|_| {
+                    ConfigError::InvalidValue(
+                        "BUZZ_USAGE_METRICS_REPLICA_MAX_AGE_MS must be a non-negative integer"
+                            .to_string(),
+                    )
+                })?,
+                Err(_) => 30_000,
+            };
 
         // Drain jitter: 0 = off (default). Clamp oversized values so every
         // delayed close is initiated with ten seconds left in the relay's
@@ -935,6 +958,9 @@ impl Config {
         );
         let partition_manager_create_enabled =
             parse_bool("BUZZ_PARTITION_MANAGER_CREATE_ENABLED", true)?;
+        // Off by default: each environment opts in after its canary.
+        let partition_manager_advance_enabled =
+            parse_bool("BUZZ_PARTITION_MANAGER_ADVANCE_ENABLED", false)?;
 
         let git_storage = GitStorageConfig::from_env()?;
 
@@ -1286,9 +1312,13 @@ impl Config {
                     None | Some("") | Some("nip98") => AdminAuth::Nip98,
                     Some("disabled") => {
                         tracing::warn!(
-                            "BUZZ_ADMIN_AUTH=disabled — the admin API is \
-                             unauthenticated; the operator has asserted that access is \
-                             controlled at the network layer (reverse proxy, VPN, firewall)"
+                            "BUZZ_ADMIN_AUTH=disabled — the admin API serves every \
+                             moderation read without authentication to anyone who can \
+                             reach the relay: reports, feedback and attachments, \
+                             restrictions, the community directory, member profiles and \
+                             any stored message by ID, in every community. Writes and \
+                             staffing are refused. Keep the whole relay port private to \
+                             people allowed to see all of that"
                         );
                         AdminAuth::Disabled
                     }
@@ -1349,6 +1379,15 @@ impl Config {
             ));
         }
 
+        let buzz_v1_enabled = std::env::var("BUZZ_V1_ENABLED").is_ok_and(|v| v == "true");
+        // Read only when enabled: a disabled relay ignores every v1 setting.
+        let buzz_v1_retention_seconds = match std::env::var("BUZZ_V1_RETENTION_SECONDS") {
+            Ok(v) if buzz_v1_enabled => v.parse().ok().filter(|s| *s > 0).ok_or_else(|| {
+                ConfigError::InvalidValue("BUZZ_V1_RETENTION_SECONDS must be positive".into())
+            })?,
+            _ => buzz_db::personal_read::DEFAULT_RETENTION_SECONDS,
+        };
+
         Ok(Self {
             assigned_bot_authority: crate::assigned_bot_config::AssignedBotAuthority::parse(
                 std::env::var("BUZZ_ASSIGNED_BOT_COMMUNITY_ID")
@@ -1362,6 +1401,7 @@ impl Config {
             database_url,
             read_database_url,
             replica_read_max_age_ms,
+            usage_metrics_replica_max_age_ms,
             drain_jitter_ms,
             redis_url,
             redis_pool_size,
@@ -1376,6 +1416,8 @@ impl Config {
             slow_client_grace_limit,
             auth,
             require_auth_token,
+            buzz_v1_enabled,
+            buzz_v1_retention_seconds,
             cors_origins,
             relay_private_key,
             uds_path,
@@ -1383,6 +1425,7 @@ impl Config {
             metrics_port,
             partition_audit_interval,
             partition_manager_create_enabled,
+            partition_manager_advance_enabled,
             pubkey_allowlist_enabled,
             require_relay_membership,
             huddle_audio_available,
@@ -1557,6 +1600,7 @@ mod tests {
         assert_eq!(config.max_frame_bytes, DEFAULT_MAX_FRAME_BYTES);
         assert_eq!(config.partition_audit_interval, Duration::from_secs(900));
         assert!(config.partition_manager_create_enabled);
+        assert!(!config.partition_manager_advance_enabled);
         assert!(config.slow_client_grace_limit > 0);
         assert!(
             !config.pubkey_allowlist_enabled,
@@ -1637,6 +1681,8 @@ mod tests {
         values: &[(&str, Option<&str>)],
     ) -> (Result<Config, ConfigError>, String) {
         use std::sync::{Arc, Mutex};
+
+        let _tracing = crate::test_support::tracing_dispatch_lock();
 
         #[derive(Clone)]
         struct CapturingMakeWriter {
@@ -1936,6 +1982,33 @@ mod tests {
     }
 
     #[test]
+    fn buzz_v1_retention_is_validated_only_when_enabled() {
+        let _guards = env_guards();
+        const KEYS: [&str; 2] = ["BUZZ_V1_ENABLED", "BUZZ_V1_RETENTION_SECONDS"];
+        let previous = KEYS.map(std::env::var_os);
+        std::env::set_var("BUZZ_V1_RETENTION_SECONDS", "0");
+        std::env::remove_var("BUZZ_V1_ENABLED");
+        let disabled = Config::from_env();
+        std::env::set_var("BUZZ_V1_ENABLED", "true");
+        let enabled = Config::from_env();
+        for (key, value) in KEYS.into_iter().zip(previous) {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        assert!(
+            disabled.is_ok(),
+            "a disabled relay ignores it: {disabled:?}"
+        );
+        assert!(matches!(
+            enabled,
+            Err(ConfigError::InvalidValue(ref message))
+                if message.contains("BUZZ_V1_RETENTION_SECONDS")
+        ));
+    }
+
+    #[test]
     fn malformed_relay_owner_pubkey_is_a_startup_error_not_warn_and_ignore() {
         let _guards = env_guards();
         let previous = std::env::var_os("RELAY_OWNER_PUBKEY");
@@ -1975,7 +2048,7 @@ mod tests {
 
     #[test]
     fn partition_manager_config_has_bounded_interval_and_create_kill_switch() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guards = env_guards();
         let previous_interval = std::env::var_os("BUZZ_PARTITION_AUDIT_INTERVAL_SECS");
         let previous_create = std::env::var_os("BUZZ_PARTITION_MANAGER_CREATE_ENABLED");
 
@@ -2007,7 +2080,7 @@ mod tests {
 
     #[test]
     fn partition_manager_create_kill_switch_parses_false_values_strictly() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guards = env_guards();
         let previous = std::env::var_os("BUZZ_PARTITION_MANAGER_CREATE_ENABLED");
 
         for value in ["FALSE", "off", "  false  "] {
@@ -2029,6 +2102,33 @@ mod tests {
             invalid,
             Err(ConfigError::InvalidValue(ref message))
                 if message.contains("BUZZ_PARTITION_MANAGER_CREATE_ENABLED")
+        ));
+    }
+
+    #[test]
+    fn partition_manager_advance_is_opt_in_and_parses_strictly() {
+        let _guards = env_guards();
+        let previous = std::env::var_os("BUZZ_PARTITION_MANAGER_ADVANCE_ENABLED");
+
+        std::env::remove_var("BUZZ_PARTITION_MANAGER_ADVANCE_ENABLED");
+        let default = Config::from_env().expect("default config");
+        std::env::set_var("BUZZ_PARTITION_MANAGER_ADVANCE_ENABLED", " TRUE ");
+        let enabled = Config::from_env().expect("enabled config");
+        std::env::set_var("BUZZ_PARTITION_MANAGER_ADVANCE_ENABLED", "enable-maybe");
+        let invalid = Config::from_env();
+
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_PARTITION_MANAGER_ADVANCE_ENABLED", value);
+        } else {
+            std::env::remove_var("BUZZ_PARTITION_MANAGER_ADVANCE_ENABLED");
+        }
+
+        assert!(!default.partition_manager_advance_enabled);
+        assert!(enabled.partition_manager_advance_enabled);
+        assert!(matches!(
+            invalid,
+            Err(ConfigError::InvalidValue(ref message))
+                if message.contains("BUZZ_PARTITION_MANAGER_ADVANCE_ENABLED")
         ));
     }
 
@@ -2244,6 +2344,35 @@ mod tests {
             ),
             other => panic!("old env name must hard-fail startup, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn usage_metrics_replica_budget_defaults_on_independently_of_serving_reads() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous_usage = std::env::var_os("BUZZ_USAGE_METRICS_REPLICA_MAX_AGE_MS");
+        let previous_serving = std::env::var_os("BUZZ_REPLICA_READ_MAX_AGE_MS");
+
+        std::env::remove_var("BUZZ_USAGE_METRICS_REPLICA_MAX_AGE_MS");
+        std::env::remove_var("BUZZ_REPLICA_READ_MAX_AGE_MS");
+        let defaults = Config::from_env().expect("config");
+
+        std::env::set_var("BUZZ_USAGE_METRICS_REPLICA_MAX_AGE_MS", "0");
+        let disabled = Config::from_env().expect("config");
+
+        if let Some(value) = previous_usage {
+            std::env::set_var("BUZZ_USAGE_METRICS_REPLICA_MAX_AGE_MS", value);
+        } else {
+            std::env::remove_var("BUZZ_USAGE_METRICS_REPLICA_MAX_AGE_MS");
+        }
+        if let Some(value) = previous_serving {
+            std::env::set_var("BUZZ_REPLICA_READ_MAX_AGE_MS", value);
+        } else {
+            std::env::remove_var("BUZZ_REPLICA_READ_MAX_AGE_MS");
+        }
+
+        assert_eq!(defaults.replica_read_max_age_ms, 0);
+        assert_eq!(defaults.usage_metrics_replica_max_age_ms, 30_000);
+        assert_eq!(disabled.usage_metrics_replica_max_age_ms, 0);
     }
 
     #[test]
@@ -2583,9 +2712,14 @@ mod tests {
     fn operator_listener_routes_reject_unsafe_or_duplicate_entries() {
         let key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         for raw in [
-            format!("{key}:http://listener.example/mentions"),
+            format!("{key}:ftp://listener.example/mentions"),
+            format!("{key}:http://user:pass@listener:8080/mentions"),
+            format!("{key}:http://listener:8080/mentions?token=secret"),
+            format!("{key}:http://listener:8080/mentions#fragment"),
             format!("{key}:https://user:pass@listener.example/mentions"),
             format!("{key}:https://listener.example/mentions?token=secret"),
+            format!("{key}:https://listener.example/mentions#fragment"),
+            format!("{key}:http://listener:8080/mentions;{key}:https://other.example"),
             format!("{key}:https://listener.example/mentions;{key}:https://other.example"),
         ] {
             assert!(
@@ -2637,15 +2771,23 @@ mod tests {
     fn valid_and_absent_operator_listener_config_preserve_routes() {
         let _guards = env_guards();
         let key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let raw = format!("{key}:https://listener.example/mentions");
-        let config = config_with_operator_listeners(Some(&raw)).expect("valid listener config");
-        assert_eq!(
-            config
-                .operator_listener_delivery_urls
-                .get(key)
-                .map(url::Url::as_str),
-            Some("https://listener.example/mentions")
-        );
+        for endpoint in [
+            "https://listener.example/mentions",
+            "http://operator-listener/mentions",
+            "http://operator-listener:8080/mentions",
+            "http://127.0.0.1:8080/mentions",
+            "http://[::1]:8080/mentions",
+        ] {
+            let raw = format!("{key}:{endpoint}");
+            let config = config_with_operator_listeners(Some(&raw)).expect("valid listener config");
+            assert_eq!(
+                config
+                    .operator_listener_delivery_urls
+                    .get(key)
+                    .map(url::Url::as_str),
+                Some(endpoint)
+            );
+        }
 
         let config = config_with_operator_listeners(None).expect("absent listener config");
         assert!(config.operator_listener_delivery_urls.is_empty());

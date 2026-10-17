@@ -111,15 +111,9 @@ pub async fn accept(
     let admission = parse(event)?;
     let mut tx = state
         .db
-        .begin_event_write_transaction()
+        .begin_event_write_transaction(tenant.community())
         .await
         .map_err(|e| IngestError::Internal(format!("error: begin admission: {e}")))?;
-    buzz_deletion::store(&state.db)
-        .guard_transaction(&mut tx, tenant.community())
-        .await
-        .map_err(|e| {
-            IngestError::Rejected(format!("restricted: community writes are fenced: {e}"))
-        })?;
     let inserted = buzz_db::channel::admit_bot_conditionally_in_transaction(
         &mut tx,
         tenant.community(),
@@ -905,13 +899,17 @@ mod postgres_tests {
     async fn conditional_admission_revalidates_after_required_member_removal_lock_wait() {
         let f = fixture(ChannelVisibility::Private, None).await;
         let mut holder = f.state.db.pool().begin().await.unwrap();
-        buzz_db::channel_members::acquire_channel_membership_lock_in_transaction(
-            &mut holder,
-            f.tenant.community(),
-            f.channel,
-        )
-        .await
-        .unwrap();
+        // The competing raw transaction models an external membership writer.
+        // Keep its mutation and the production membership lock on one backend.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!(
+                "buzz_channel_membership:{}:{}",
+                f.tenant.community(),
+                f.channel
+            ))
+            .execute(&mut *holder)
+            .await
+            .unwrap();
         let (state, tenant, event, actor) = (
             f.state.clone(),
             f.tenant.clone(),
@@ -992,10 +990,7 @@ mod postgres_tests {
             .tags(roster_tags)
             .sign_with_keys(&f.state.relay_keypair)
             .unwrap();
-        snapshot
-            .replace_member_event(f.tenant.community(), f.channel, &roster)
-            .await
-            .unwrap();
+        snapshot.replace_member_event(&roster).await.unwrap();
         let (state, tenant, actor, event) = (
             f.state.clone(),
             f.tenant.clone(),
