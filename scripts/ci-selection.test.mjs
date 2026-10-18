@@ -387,4 +387,6 @@ test("required security job executes the locked isolated keyring harness", () =>
   const keys = relay.split("\n").filter((line) => line.includes("key: relay-artifacts-"));
   assert.equal(keys.length, 2);
   for (const key of keys) assert.ok(key.includes("'third_party/**'"));
+  const docker = readFileSync(new URL("../.github/workflows/docker.yml", import.meta.url), "utf8");
+  assert.ok(docker.includes('- "third_party/**"'));
 });

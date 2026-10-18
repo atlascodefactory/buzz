@@ -61,19 +61,26 @@ fn main() {
         assert!(matches!(after.get_secret(), Err(Error::NoEntry)));
         before.set_secret(&[0, 255, 1, 128]).unwrap();
         assert_eq!(after.get_secret().unwrap(), [0, 255, 1, 128]);
+        let attrs = HashMap::from([("service", "mesh-llm"), ("username", user)]);
+        let binary_items = collection.search_items(attrs.clone()).unwrap();
+        assert_eq!(binary_items.len(), 1);
+        assert_eq!(
+            binary_items[0].get_secret_content_type().unwrap(),
+            "application/octet-stream"
+        );
+        // Gnome Keyring reports valid UTF-8 as text/plain even when a client
+        // sends application/octet-stream. Compare both backends on this provider.
+        before.set_password("alter Text–🔑").unwrap();
+        let old_text_mime = binary_items[0].get_secret_content_type().unwrap();
         after.set_password("aktualisiert–🔑").unwrap();
         assert_eq!(before.get_password().unwrap(), "aktualisiert–🔑");
-        let attrs = HashMap::from([("service", "mesh-llm"), ("username", user)]);
         let items = collection.search_items(attrs.clone()).unwrap();
         assert_eq!(items.len(), 1, "updating must not duplicate the identity");
         assert_eq!(
             items[0].get_label().unwrap(),
             format!("keyring:{user}@mesh-llm")
         );
-        assert_eq!(
-            items[0].get_secret_content_type().unwrap(),
-            "application/octet-stream"
-        );
+        assert_eq!(items[0].get_secret_content_type().unwrap(), old_text_mime);
         let metadata = items[0].get_attributes().unwrap();
         assert_eq!(
             metadata.get("service").map(String::as_str),

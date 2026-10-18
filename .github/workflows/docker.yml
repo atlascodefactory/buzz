@@ -67,6 +67,7 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - "crates/**"
+      - "third_party/**"
       - "web/**"
       - "package.json"
       - "pnpm-lock.yaml"
