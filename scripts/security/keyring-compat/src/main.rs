@@ -64,12 +64,15 @@ fn main() {
         let attrs = HashMap::from([("service", "mesh-llm"), ("username", user)]);
         let binary_items = collection.search_items(attrs.clone()).unwrap();
         assert_eq!(binary_items.len(), 1);
+        let old_binary_mime = binary_items[0].get_secret_content_type().unwrap();
+        after.set_secret(&[11, 0, 222]).unwrap();
+        assert_eq!(before.get_secret().unwrap(), [11, 0, 222]);
         assert_eq!(
             binary_items[0].get_secret_content_type().unwrap(),
-            "application/octet-stream"
+            old_binary_mime
         );
-        // Gnome Keyring reports valid UTF-8 as text/plain even when a client
-        // sends application/octet-stream. Compare both backends on this provider.
+        // Secret Service providers may normalize content types. Compare both
+        // backends for binary and UTF-8 data rather than assume a provider MIME.
         before.set_password("alter Text–🔑").unwrap();
         let old_text_mime = binary_items[0].get_secret_content_type().unwrap();
         after.set_password("aktualisiert–🔑").unwrap();
