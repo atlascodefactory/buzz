@@ -68,3 +68,22 @@ indefinite wait on a still-live session bus. A synthetic provider tests locked,
 denied, approved and provider-exit paths; recorded protocol milestones ensure a
 failure cannot pass before the intended prompt. All item/collection creation and
 secret writes are observed. A separate no-bus process tests startup failure.
+
+## Desktop updater ZIP dependency
+
+The desktop workspace patches the published `tauri-plugin-updater` 2.10.1
+manifest to use ZIP 9.0.5 on Windows instead of ZIP 4.6.1. The runtime source, installer
+selection, HTTPS configuration and Minisign verification are unchanged. Added
+Windows tests exercise the real extraction method with MSI/NSIS packages,
+Unicode filenames, corrupt input and directory traversal. Published
+updater 2.14.0 still uses ZIP 4, so updating that package alone does not close
+RUSTSEC-2026-0367, -0368 and -0369. Remove this patch once an official release
+uses the patched ZIP API. The exact original file hashes are in PROVENANCE.json.
+The upstream standalone Cargo.lock is omitted; the desktop workspace lockfile
+is authoritative for this library dependency.
+
+This patch does not resolve the separate GTK/proc-macro-error and ZBus maintenance
+advisories. They require upstream framework migrations and remain visible in the
+desktop advisory check. `user-idle` remains Windows-only; its macOS dependencies
+still appear in Cargo's all-platform lockfile, but macOS now queries the native
+Core Graphics event source through the maintained objc2 binding.
