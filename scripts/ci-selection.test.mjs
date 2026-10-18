@@ -364,3 +364,27 @@ test("PR API denial fails path selection instead of reporting no changes", async
     return true;
   });
 });
+
+test("dependency patches and keyring harness select security and native suites", async () => {
+  for (const path of [
+    "third_party/keyring/src/v1.rs",
+    "scripts/security/keyring-compat/src/main.rs",
+  ]) {
+    const result = await select([path]);
+    assert.equal(result.rust, "true");
+    assert.equal(result["desktop-rust"], "true");
+  }
+});
+
+test("required security job executes the locked isolated keyring harness", () => {
+  const security = readFileSync(new URL("../.github/workflows/_ci-security.yml", import.meta.url), "utf8");
+  assert.match(security, /run: scripts\/security\/run-keyring-compat\.sh/);
+  const runner = readFileSync(new URL("security/run-keyring-compat.sh", import.meta.url), "utf8");
+  assert.match(runner, /cargo build --locked/);
+  assert.match(runner, /dbus-run-session/);
+  assert.match(runner, /HOME="\$test_home"/);
+  const relay = readFileSync(new URL("../.github/workflows/_ci-relay.yml", import.meta.url), "utf8");
+  const keys = relay.split("\n").filter((line) => line.includes("key: relay-artifacts-"));
+  assert.equal(keys.length, 2);
+  for (const key of keys) assert.ok(key.includes("'third_party/**'"));
+});

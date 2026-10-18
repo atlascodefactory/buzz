@@ -137,14 +137,27 @@ async function payloadsFor(page: Page, command: string) {
 
 async function menuValues(page: Page, trigger: Locator) {
   await trigger.click();
-  const rows = await page.getByRole("menuitemradio").allTextContents();
+  const menu = await openMenu(page, trigger);
+  const rows = await menu.getByRole("menuitemradio").allTextContents();
   await page.keyboard.press("Escape");
+  await expect(trigger).toHaveAttribute("aria-expanded", "false");
   return rows;
+}
+
+async function openMenu(page: Page, trigger: Locator) {
+  await expect(trigger).toHaveAttribute("aria-expanded", "true");
+  const menuId = await trigger.getAttribute("aria-controls");
+  expect(menuId).toBeTruthy();
+  // An unrelated menu can remain mounted during its closing animation.
+  const menu = page.locator(`[id="${menuId}"][data-state="open"]`);
+  await expect(menu).toBeVisible();
+  return menu;
 }
 
 async function pick(page: Page, trigger: Locator, name: string) {
   await trigger.press("Enter");
-  const option = page.getByRole("menuitemradio", { name, exact: true });
+  const menu = await openMenu(page, trigger);
+  const option = menu.getByRole("menuitemradio", { name, exact: true });
   await expect(option).toBeVisible();
   // Keyboard selection avoids racing the menu's open animation.
   await option.press("Enter");

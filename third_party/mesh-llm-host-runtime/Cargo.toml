@@ -1,0 +1,139 @@
+[package]
+name = "mesh-llm-host-runtime"
+version = "0.76.2"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Host runtime orchestration for mesh-llm nodes"
+repository = "https://github.com/Mesh-LLM/mesh-llm"
+homepage = "https://github.com/Mesh-LLM/mesh-llm"
+readme = "README.md"
+
+[features]
+default = ["web-ui", "dynamic-native-runtime"]
+# Embed the React web console into the binary. Default on; turn off for
+# lib-style / headless consumers that don't need the console assets.
+# Propagates to `mesh-llm-ui/embed-assets`.
+web-ui = ["mesh-llm-ui/embed-assets"]
+dynamic-native-runtime = [
+    "mesh-llm-system/dynamic-native-runtime",
+    "skippy-runtime/dynamic-native-runtime",
+    "skippy-server/dynamic-native-runtime",
+]
+
+[lints.clippy]
+cognitive_complexity = "warn"
+too_many_lines = "warn"
+
+[dependencies]
+bytes = "1"
+mesh-llm-build-info = { version = "0.76.2", git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2" }
+mesh-mixture-of-agents = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+mesh-llm-config = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+mesh-llm-events = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+mesh-llm-log-store = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+mesh-llm-plugin = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+mesh-llm-plugin-manager = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+mesh-llm-identity = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2", features = ["host-io"]  }
+mesh-llm-native-runtime = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+mesh-native-serving-plugin-host = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2" }
+mesh-llm-runtime-install = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+mesh-llm-guardrails = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+mesh-llm-protocol = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+mesh-llm-routing = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+mesh-llm-system = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2", features = ["skippy-devices"]  }
+mesh-llm-types = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+mesh-llm-ui = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2", default-features = false  }
+mesh-llm-node = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+mesh-llm-api-server = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+mesh-client = { package = "mesh-llm-client", git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2", features = ["host-io"]  }
+model-artifact = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+model-hf = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+model-package = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+model-ref = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+model-resolver = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+openai-frontend = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+skippy-protocol = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+skippy-coordinator = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+skippy-runtime = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+skippy-ffi = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2", default-features = false }
+skippy-model = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2" }
+skippy-server = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+skippy-topology = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+skippy-package-format = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+iroh = { version = "1.0.3", default-features = false, features = ["metrics", "fast-apple-datapath", "portmapper", "tls-aws-lc-rs", "unstable-net-report"] }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+same-file = "1.0.6"
+socket2 = { version = "0.6", features = ["all"] }
+anyhow = "1"
+async-trait = "0.1"
+rand = "0.10"
+base64 = "0.23"
+dirs = "6.0.0"
+hex = "0.4.3"
+nostr-sdk = { version = "0.45.1", default-features = false }
+opentelemetry = { version = "0.32.0", default-features = false, features = ["metrics"] }
+opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["metrics"] }
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["metrics", "http-proto", "reqwest-blocking-client"] }
+rustls = "0.23.36"
+reqwest = { version = "0.13", features = ["stream", "json"] }
+flate2 = "1"
+futures-util = "0.3"
+semver = "1"
+sha2 = "0.11"
+tar = "0.4"
+ed25519-dalek = { version = "=3.0.0", features = ["rand_core"] }
+crypto_box = "0.9"
+chacha20poly1305 = "0.11"
+argon2 = "0.6"
+thiserror = "2"
+zeroize = { version = "1", features = ["derive"] }
+rpassword = "7.5"
+keyring = "4.2"
+chrono = { version = "0.4", features = ["serde"] }
+httparse = "1"
+http = "1"
+http-body-util = "0.1"
+tokio-stream = "0.1"
+crossterm = "0.29"
+url = "2"
+urlencoding = "2"
+uuid = { version = "1", features = ["v4"] }
+libc = "0.2.183"
+mdns-sd = "0.21"
+regex-lite = "0.1"
+rmcp = { version = "3", features = ["client", "server", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
+axum = "0.8"
+schemars = "1"
+prost = "0.14"
+toml = "1.1"
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
+hf_hub = { package = "mesh-llm-hf-hub", version = "1.0.2", default-features = false, features = ["blocking"] }
+tabwriter = "1"
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }
+
+[dev-dependencies]
+serial_test = "4"
+opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["metrics", "testing"] }
+mesh-client = { package = "mesh-llm-client", git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.76.2", version = "0.76.2"  }
+# Used by the gated-relay regression test to spawn an in-process iroh-relay
+# with AccessConfig::Restricted, then build a real iroh::Endpoint from our
+# relay_map_from_urls output and verify --relay-auth tokens reach the relay
+# on the WebSocket upgrade (and that the wrong token is rejected).
+iroh = { version = "1.0.3", features = ["test-utils"] }
+iroh-relay = { version = "1.0.3", features = ["server", "test-utils"] }
+
+# This patched dependency is not a member of the Buzz workspace.
+[workspace]

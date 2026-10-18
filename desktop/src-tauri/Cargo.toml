@@ -139,7 +139,7 @@ png = "0.18"
 # target-gated inside arboard; at runtime X11 sessions still fall back to X11.
 arboard = { version = "3", features = ["wayland-data-control"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
-zip = "8"
+zip = "9.0.5"
 flate2 = "1"
 sherpa-onnx = "1.12"
 regex = "1"
@@ -163,3 +163,12 @@ tokio = { version = "1", features = ["test-util"] }
 # The relay's media validation, so desktop-produced snapshots and voice notes
 # can prove their full client-sanitize → relay-accept contract end to end.
 buzz_media_pkg = { package = "buzz-media", path = "../../crates/buzz-media" }
+
+[patch.crates-io]
+keyring = { path = "../../third_party/keyring" }
+dbus-secret-service = { path = "../../third_party/dbus-secret-service" }
+
+[patch."https://github.com/Mesh-LLM/mesh-llm.git"]
+mesh-llm-host-runtime = { path = "../../third_party/mesh-llm-host-runtime" }
+mesh-llm-plugin-manager = { path = "../../third_party/mesh-llm-plugin-manager" }
+mesh-llm-system = { path = "../../third_party/mesh-llm-system" }

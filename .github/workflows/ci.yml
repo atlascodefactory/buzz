@@ -44,6 +44,8 @@ jobs:
           # runtime directories remains covered by the directory filters below.
           filters: |
             rust:
+              - 'third_party/**'
+              - 'scripts/security/**'
               - 'crates/**'
               - 'migrations/**'
               - 'schema/**'
@@ -82,6 +84,8 @@ jobs:
               - 'desktop/**'
               - 'pnpm-lock.yaml'
             desktop-rust:
+              - 'third_party/**'
+              - 'scripts/security/**'
               - 'desktop/src-tauri/**'
             web:
               - 'web/**'

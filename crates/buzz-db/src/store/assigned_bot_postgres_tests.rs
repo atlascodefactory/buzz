@@ -1072,12 +1072,14 @@ async fn assigned_access_system_rooms_require_current_owner_membership() {
         .await
         .unwrap();
         tx.commit().await.unwrap();
-        assert!(
-            crate::channel_members::get_readable_system_channel_ids(&f.pool, f.community, &bot)
-                .await
-                .unwrap()
-                .contains(&f.channel)
-        );
+        assert!(crate::channel_members::get_readable_system_channel_ids(
+            &f.pool,
+            f.community,
+            &bot
+        )
+        .await
+        .unwrap()
+        .contains(&f.channel));
 
         // Retain the bot's membership and global assignment while its owner leaves.
         let mut tx = admitted(&f.pool, f.community).await.unwrap();
@@ -1093,15 +1095,19 @@ async fn assigned_access_system_rooms_require_current_owner_membership() {
         .unwrap();
         tx.commit().await.unwrap();
         assert_eq!(
-            access_status(&f.pool, f.community, &bot, None).await.unwrap(),
+            access_status(&f.pool, f.community, &bot, None)
+                .await
+                .unwrap(),
             Some(true)
         );
-        assert!(
-            !crate::channel_members::get_readable_system_channel_ids(&f.pool, f.community, &bot)
-                .await
-                .unwrap()
-                .contains(&f.channel)
-        );
+        assert!(!crate::channel_members::get_readable_system_channel_ids(
+            &f.pool,
+            f.community,
+            &bot
+        )
+        .await
+        .unwrap()
+        .contains(&f.channel));
         // Ordinary members still read open system channels without joining them.
         assert_eq!(
             crate::channel_members::get_readable_system_channel_ids(&f.pool, f.community, &owner)
@@ -1123,12 +1129,14 @@ async fn assigned_access_system_rooms_require_current_owner_membership() {
         .await
         .unwrap();
         tx.commit().await.unwrap();
-        assert!(
-            crate::channel_members::get_readable_system_channel_ids(&f.pool, f.community, &bot)
-                .await
-                .unwrap()
-                .contains(&f.channel)
-        );
+        assert!(crate::channel_members::get_readable_system_channel_ids(
+            &f.pool,
+            f.community,
+            &bot
+        )
+        .await
+        .unwrap()
+        .contains(&f.channel));
     }
 }
 

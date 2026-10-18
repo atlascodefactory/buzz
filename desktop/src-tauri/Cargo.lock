@@ -916,7 +916,7 @@ dependencies = [
  "arrayvec",
  "cc",
  "cfg-if 1.0.4",
- "constant_time_eq",
+ "constant_time_eq 0.4.2",
  "cpufeatures 0.3.0",
 ]
 
@@ -946,15 +946,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a8894febbff9f758034a5b8e12d87918f56dfc64a8e1fe757d65e29041538d93"
 dependencies = [
  "generic-array",
-]
-
-[[package]]
-name = "block-padding"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "710f1dd022ef4e93f8a438b4ba958de7f64308434fa6a87104481645cc30068b"
-dependencies = [
- "hybrid-array",
 ]
 
 [[package]]
@@ -1208,7 +1199,7 @@ dependencies = [
  "window-vibrancy",
  "windows-sys 0.61.2",
  "zeroize",
- "zip 8.6.0",
+ "zip 9.0.5",
 ]
 
 [[package]]
@@ -1451,15 +1442,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "26b52a9543ae338f279b96b0b9fed9c8093744685043739079ce85cd58f289a6"
 dependencies = [
  "cipher 0.4.4",
-]
-
-[[package]]
-name = "cbc"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce2dc9ee5f88d11e0beb842c88b33c8a5cf0d1329c4b19494af42b07dbfe8896"
-dependencies = [
- "cipher 0.5.2",
 ]
 
 [[package]]
@@ -1808,6 +1790,15 @@ name = "constant_time_eq"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
+
+[[package]]
+name = "constant_time_eq"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb6feb175df65d0a3ccd3e73484e940d0ac664e8034f0519fd49a93db3071d9"
+dependencies = [
+ "rustversion",
+]
 
 [[package]]
 name = "convert_case"
@@ -2404,20 +2395,28 @@ dependencies = [
 [[package]]
 name = "dbus-secret-service"
 version = "4.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "708b509edf7889e53d7efb0ffadd994cc6c2345ccb62f55cfd6b0682165e4fa6"
 dependencies = [
  "aes 0.8.4",
- "block-padding 0.3.3",
- "cbc 0.1.2",
+ "block-padding",
+ "cbc",
  "dbus",
- "fastrand",
- "hkdf 0.12.4",
+ "getrandom 0.3.4",
+ "hkdf",
  "num",
  "once_cell",
  "openssl",
  "sha2 0.10.9",
  "zeroize",
+]
+
+[[package]]
+name = "dbus-secret-service-keyring-store"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7227ffd3b4896266bbc100348025cebe51d9aea94ce118a1d68f4a6463963dae"
+dependencies = [
+ "dbus-secret-service",
+ "keyring-core",
 ]
 
 [[package]]
@@ -3939,15 +3938,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hkdf"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
-dependencies = [
- "hmac 0.13.0",
-]
-
-[[package]]
 name = "hmac"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4381,7 +4371,7 @@ version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
- "block-padding 0.3.3",
+ "block-padding",
  "generic-array",
 ]
 
@@ -4391,7 +4381,6 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7"
 dependencies = [
- "block-padding 0.4.2",
  "hybrid-array",
 ]
 
@@ -4820,7 +4809,7 @@ dependencies = [
  "dbus-secret-service",
  "log",
  "openssl",
- "secret-service 4.0.0",
+ "secret-service",
  "security-framework 2.11.1",
  "security-framework 3.7.0",
  "windows-sys 0.60.2",
@@ -4830,13 +4819,11 @@ dependencies = [
 [[package]]
 name = "keyring"
 version = "4.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2270074a3d26bcac93c1dc5d2845eb4c089e8d761ccf6e0ea266a16004640627"
 dependencies = [
  "apple-native-keyring-store",
+ "dbus-secret-service-keyring-store",
  "keyring-core",
  "windows-native-keyring-store",
- "zbus-secret-service-keyring-store",
 ]
 
 [[package]]
@@ -5095,9 +5082,9 @@ dependencies = [
 
 [[package]]
 name = "lzma-rust2"
-version = "0.16.5"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca93e534d1142d1d0dcca6d25fe302508a5dfb40b302802904577725ea0b695b"
+checksum = "7277c9742229dc25243236d578b6471a798c554512c6f6a04365ec2e87c2a3bb"
 dependencies = [
  "sha2 0.11.0",
 ]
@@ -5429,7 +5416,6 @@ dependencies = [
 [[package]]
 name = "mesh-llm-host-runtime"
 version = "0.76.2"
-source = "git+https://github.com/Mesh-LLM/mesh-llm.git?tag=v0.76.2#a0c1e66b0ac037dd56544b9e2d94969ea43d694f"
 dependencies = [
  "anyhow",
  "argon2",
@@ -5521,7 +5507,7 @@ dependencies = [
  "uuid",
  "windows-sys 0.61.2",
  "zeroize",
- "zip 8.6.0",
+ "zip 9.0.5",
 ]
 
 [[package]]
@@ -5611,7 +5597,6 @@ dependencies = [
 [[package]]
 name = "mesh-llm-plugin-manager"
 version = "0.76.2"
-source = "git+https://github.com/Mesh-LLM/mesh-llm.git?tag=v0.76.2#a0c1e66b0ac037dd56544b9e2d94969ea43d694f"
 dependencies = [
  "anyhow",
  "dirs",
@@ -5625,7 +5610,7 @@ dependencies = [
  "sha2 0.11.0",
  "tar",
  "tempfile",
- "zip 8.6.0",
+ "zip 9.0.5",
 ]
 
 [[package]]
@@ -5713,7 +5698,6 @@ dependencies = [
 [[package]]
 name = "mesh-llm-system"
 version = "0.76.2"
-source = "git+https://github.com/Mesh-LLM/mesh-llm.git?tag=v0.76.2#a0c1e66b0ac037dd56544b9e2d94969ea43d694f"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5734,7 +5718,7 @@ dependencies = [
  "sha2 0.11.0",
  "skippy-runtime",
  "tracing",
- "zip 8.6.0",
+ "zip 9.0.5",
 ]
 
 [[package]]
@@ -6419,7 +6403,7 @@ dependencies = [
  "bech32 0.11.1",
  "bip39",
  "bitcoin_hashes 0.14.101",
- "cbc 0.1.2",
+ "cbc",
  "chacha20 0.9.1",
  "chacha20poly1305 0.10.1",
  "getrandom 0.2.17",
@@ -6443,7 +6427,7 @@ dependencies = [
  "bech32 0.12.0",
  "bip39",
  "bitcoin_hashes 1.2.0",
- "cbc 0.1.2",
+ "cbc",
  "chacha20 0.9.1",
  "chacha20poly1305 0.10.1",
  "faster-hex",
@@ -7869,9 +7853,9 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
 name = "ppmd-rust"
-version = "1.4.0"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "efca4c95a19a79d1c98f791f10aebd5c1363b473244630bb7dbde1dc98455a24"
+checksum = "196a7c80b9a7652aba7cc070827516c2abe4ccdf53d128e1944003cf5726cff1"
 
 [[package]]
 name = "ppv-lite86"
@@ -9350,35 +9334,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4d35ad99a181be0a60ffcbe85d680d98f87bdc4d7644ade319b87076b9dbfd4"
 dependencies = [
  "aes 0.8.4",
- "cbc 0.1.2",
+ "cbc",
  "futures-util",
  "generic-array",
- "hkdf 0.12.4",
+ "hkdf",
  "num",
  "once_cell",
  "rand 0.8.6",
  "serde",
  "sha2 0.10.9",
  "zbus 4.4.0",
-]
-
-[[package]]
-name = "secret-service"
-version = "5.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5107b24b91445dd2aa449a258a1807b63240942157292354dc5bfdbeb8bc6db8"
-dependencies = [
- "aes 0.9.1",
- "cbc 0.2.1",
- "futures-util",
- "getrandom 0.4.3",
- "hkdf 0.13.0",
- "hybrid-array",
- "num",
- "once_cell",
- "serde",
- "sha2 0.11.0",
- "zbus 5.17.0",
 ]
 
 [[package]]
@@ -13844,17 +13809,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zbus-secret-service-keyring-store"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74801d001b9e7729adb4f1825b67b398185fed424749aa3d8bacf70417137d9a"
-dependencies = [
- "keyring-core",
- "secret-service 5.2.0",
- "zbus 5.17.0",
-]
-
-[[package]]
 name = "zbus_macros"
 version = "4.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14012,13 +13966,13 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "8.6.0"
+version = "9.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
+checksum = "6e04976da629d3b04204ba8105b396a193af8ad2583b2c79bfb3ab8af580a11e"
 dependencies = [
  "aes 0.9.1",
  "bzip2 0.6.1",
- "constant_time_eq",
+ "constant_time_eq 0.6.1",
  "crc32fast",
  "deflate64",
  "flate2",
@@ -14027,6 +13981,7 @@ dependencies = [
  "indexmap 2.14.0",
  "lzma-rust2",
  "memchr",
+ "nix 0.31.3",
  "pbkdf2 0.13.0",
  "ppmd-rust",
  "sha1 0.11.0",
@@ -14063,27 +14018,27 @@ dependencies = [
 
 [[package]]
 name = "zstd"
-version = "0.13.3"
+version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
 dependencies = [
  "zstd-safe",
 ]
 
 [[package]]
 name = "zstd-safe"
-version = "7.2.4"
+version = "8.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d"
+checksum = "ded520f16b29e1a9b771c722221b2b0a0398c2316d9bb3c42b458a5414d7434b"
 dependencies = [
  "zstd-sys",
 ]
 
 [[package]]
 name = "zstd-sys"
-version = "2.0.16+zstd.1.5.7"
+version = "2.1.2+zstd.1.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748"
+checksum = "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
 dependencies = [
  "cc",
  "pkg-config",
