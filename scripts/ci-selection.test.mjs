@@ -218,11 +218,27 @@ const scenarios = [
   ],
   ["mobile lockfile", ["mobile/pubspec.lock"], ["mobile"]],
   ["mobile release script", ["scripts/mobile-release.sh"], ["mobile"]],
+  [
+    "mobile gateway recipe tests",
+    ["scripts/test-mobile-gateway-recipes.sh"],
+    ["mobile"],
+  ],
   ["desktop", ["desktop/src/main.tsx"], ["desktop"]],
   ["Tauri", ["desktop/src-tauri/src/main.rs"], ["desktop", "desktop-rust"]],
   ["relay", ["crates/buzz-relay/src/main.rs"], ["rust"]],
   ["migration", ["migrations/123.sql"], ["rust"]],
-  ["shared workflow", [".github/workflows/ci.yml"], ["rust", "mobile"]],
+  [
+    "shared workflow",
+    [".github/workflows/ci.yml"],
+    ["desktop", "mobile", "rust"],
+  ],
+  [
+    "desktop workflow",
+    [".github/workflows/_ci-desktop.yml"],
+    ["desktop", "mobile", "rust"],
+  ],
+  ["Justfile", ["Justfile"], ["desktop", "mobile", "rust"]],
+  ["CI apt retry", ["scripts/ci-apt-retry.sh"], ["desktop", "rust"]],
   ["integration services", ["docker-compose.yml"], ["rust"]],
   ["CI integration images", ["docker-compose.ci.yml"], ["rust"]],
   [
@@ -347,4 +363,30 @@ test("PR API denial fails path selection instead of reporting no changes", async
     assert.match(error.stdout + error.stderr, /Fixture access denied/);
     return true;
   });
+});
+
+test("dependency patches and keyring harness select security and native suites", async () => {
+  for (const path of [
+    "third_party/keyring/src/v1.rs",
+    "scripts/security/keyring-compat/src/main.rs",
+  ]) {
+    const result = await select([path]);
+    assert.equal(result.rust, "true");
+    assert.equal(result["desktop-rust"], "true");
+  }
+});
+
+test("required security job executes the locked isolated keyring harness", () => {
+  const security = readFileSync(new URL("../.github/workflows/_ci-security.yml", import.meta.url), "utf8");
+  assert.match(security, /run: scripts\/security\/run-keyring-compat\.sh/);
+  const runner = readFileSync(new URL("security/run-keyring-compat.sh", import.meta.url), "utf8");
+  assert.match(runner, /cargo build --locked/);
+  assert.match(runner, /dbus-run-session/);
+  assert.match(runner, /HOME="\$test_home"/);
+  const relay = readFileSync(new URL("../.github/workflows/_ci-relay.yml", import.meta.url), "utf8");
+  const keys = relay.split("\n").filter((line) => line.includes("key: relay-artifacts-"));
+  assert.equal(keys.length, 2);
+  for (const key of keys) assert.ok(key.includes("'third_party/**'"));
+  const docker = readFileSync(new URL("../.github/workflows/docker.yml", import.meta.url), "utf8");
+  assert.ok(docker.includes('- "third_party/**"'));
 });

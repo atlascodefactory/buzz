@@ -38,15 +38,14 @@ async fn spawn_insert(f: &Fixture) -> (i32, tokio::task::JoinHandle<Result<bool>
         (f.pool.clone(), f.community, f.channel, bot_message(f));
     let (started, waiting) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
-        let mut tx = pool.begin().await.unwrap();
+        let mut tx = admitted(&pool, community).await.unwrap();
         let pid = sqlx::query_scalar("SELECT pg_backend_pid()")
-            .fetch_one(&mut *tx)
+            .fetch_one(tx.conn())
             .await
             .unwrap();
         started.send(pid).unwrap();
         let result =
-            crate::event::insert_event_in_transaction(&mut tx, community, &event, Some(channel))
-                .await;
+            crate::event::insert_event_in_transaction(&mut tx, &event, Some(channel)).await;
         match result {
             Ok((_, inserted)) => {
                 tx.commit().await.unwrap();
@@ -65,16 +64,11 @@ async fn spawn_insert(f: &Fixture) -> (i32, tokio::task::JoinHandle<Result<bool>
 #[ignore = "requires Postgres"]
 async fn absent_assignment_is_locked_through_event_commit() {
     let f = Fixture::new().await;
-    let mut event_tx = f.pool.begin().await.unwrap();
+    let mut event_tx = admitted(&f.pool, f.community).await.unwrap();
     // Unassigned legacy author still succeeds; absence itself must be fenced.
-    crate::event::insert_event_in_transaction(
-        &mut event_tx,
-        f.community,
-        &bot_message(&f),
-        Some(f.channel),
-    )
-    .await
-    .unwrap();
+    crate::event::insert_event_in_transaction(&mut event_tx, &bot_message(&f), Some(f.channel))
+        .await
+        .unwrap();
     let pool = f.pool.clone();
     let observe = f.pool.clone();
     let (started, waiting) = tokio::sync::oneshot::channel();
@@ -135,15 +129,10 @@ async fn absent_owner_and_bot_bans_are_locked_through_event_commit() {
     for owner in [true, false] {
         let f = Fixture::new().await;
         f.apply(&f.command(false, 1, Uuid::new_v4())).await.unwrap();
-        let mut event_tx = f.pool.begin().await.unwrap();
-        crate::event::insert_event_in_transaction(
-            &mut event_tx,
-            f.community,
-            &bot_message(&f),
-            Some(f.channel),
-        )
-        .await
-        .unwrap();
+        let mut event_tx = admitted(&f.pool, f.community).await.unwrap();
+        crate::event::insert_event_in_transaction(&mut event_tx, &bot_message(&f), Some(f.channel))
+            .await
+            .unwrap();
         let pool = f.pool.clone();
         let observe = f.pool.clone();
         let (started, waiting) = tokio::sync::oneshot::channel();

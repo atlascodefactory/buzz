@@ -57,13 +57,9 @@ pub async fn accept(
     };
     let mut tx = state
         .db
-        .begin_event_write_transaction()
+        .begin_event_write_transaction(community)
         .await
         .map_err(|_| IngestError::Internal("error: begin assigned bot command".into()))?;
-    buzz_deletion::store(&state.db)
-        .guard_transaction(&mut tx, community)
-        .await
-        .map_err(|_| IngestError::Rejected("restricted: community writes are fenced".into()))?;
     let inspection = matches!(command.operation(), AssignedBotOperation::Inspect { .. });
     let (inserted, observation) = if inspection {
         buzz_db::assigned_bot::inspect_in_transaction(&mut tx, &command)

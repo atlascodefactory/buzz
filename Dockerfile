@@ -54,6 +54,7 @@ FROM chef AS builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
+        cmake \
         pkg-config \
         libssl-dev \
         ca-certificates \
@@ -63,6 +64,8 @@ RUN apt-get update \
 # locations. The normal runtime strips it below; runtime-debug retains it.
 ENV CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
 COPY --from=planner /build/recipe.json recipe.json
+# cargo-chef does not materialize standalone path patches from its recipe.
+COPY third_party/ third_party/
 # Cook the full workspace recipe — relay deps include workspace siblings, so
 # scoping to -p buzz-relay misses transitive deps and re-builds them later.
 RUN cargo chef cook --release --recipe-path recipe.json

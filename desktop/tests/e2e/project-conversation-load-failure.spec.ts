@@ -77,13 +77,13 @@ test.describe("project conversation load failure", () => {
     await installMockBridge(page);
     await page.goto("/", { waitUntil: "domcontentloaded" });
 
-    // Seed the conversation BEFORE opening general — i.e. before its live
-    // subscription exists — so the reply lands in the mock store (searchable,
-    // and returnable by a successful get_thread_replies) but is never live
-    // pushed into the thread-replies cache. If general were open first, the
-    // live handler would seed that cache and the panel would render the list
-    // branch, masking the error card. The root carries the repository discovery
-    // token so it surfaces as the channel's latest discussion hit (what the
+    // Seed historical messages BEFORE opening general so the reply stays in
+    // the mock store (returnable by a successful get_thread_replies), outside
+    // the live subscription's `since: now` replay window. A current or future
+    // reply can be replayed into the thread-replies cache when the panel opens,
+    // masking the error card despite the failed fetch. The root carries the
+    // repository discovery token so it surfaces as the channel's latest
+    // discussion hit (what the
     // Channels-tab row opens); its reply omits the token so it never competes
     // to be the opened hit.
     //
@@ -103,7 +103,7 @@ test.describe("project conversation load failure", () => {
       .toBe(true);
     const rootId = await page.evaluate(
       ({ author, rootContent, replyContent }) => {
-        const now = Math.floor(Date.now() / 1000);
+        const rootTime = Math.floor(Date.now() / 1000) - 60;
         const emit = (
           window as typeof window & {
             __BUZZ_E2E_EMIT_MOCK_MESSAGE__: (input: {
@@ -119,14 +119,14 @@ test.describe("project conversation load failure", () => {
           channelName: "general",
           content: rootContent,
           pubkey: author,
-          createdAt: now,
+          createdAt: rootTime,
         });
         emit({
           channelName: "general",
           content: replyContent,
           parentEventId: root.id,
           pubkey: author,
-          createdAt: now + 1,
+          createdAt: rootTime + 1,
         });
         return root.id;
       },

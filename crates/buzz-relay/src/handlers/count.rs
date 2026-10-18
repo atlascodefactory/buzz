@@ -1,5 +1,6 @@
 //! NIP-45 COUNT handler — aggregate queries with channel access enforcement.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use nostr::Filter;
@@ -119,10 +120,29 @@ pub async fn handle_count(
     // this, a scoped token would COUNT events in channels outside its scope via
     // the no-channel-filter SQL pushdown below (which counts every accessible
     // channel). The per-filter targeted-channel repair is bounded by the same
-    // scope through `resolve_request_local_access`'s `token_allows` argument.
+    // scope through `confirm_requested_channel_access`'s `token_channel_ids` argument.
     if let Some(allowed) = token_channel_ids.as_deref() {
         accessible_channels.retain(|channel_id| allowed.contains(channel_id));
     }
+    // System channels are outside `accessible_channels`; a filter that names
+    // one counts it in its own scope only, as in the WS REQ handler.
+    let mut readable_system = match super::system_channels::readable_system_channels_for_filters(
+        &state,
+        conn.tenant.community(),
+        &pubkey_bytes,
+        &filters,
+        &accessible_channels,
+        token_channel_ids.as_deref(),
+    )
+    .await
+    {
+        Ok(ids) => ids,
+        Err(e) => {
+            warn!(sub_id = %sub_id, "Failed to get readable system channels: {e}");
+            conn.send(RelayMessage::closed(&sub_id, "error: database error"));
+            return;
+        }
+    };
 
     // B2: acquire effect permit immediately before the first DB count query.
     // The permit is held through all count queries and the COUNT response.
@@ -168,40 +188,45 @@ pub async fn handle_count(
             && !result_gated_count_safe_for_pushdown(filter, &authed_pubkey_hex);
 
         if let Some(requested_channels) = requested_channels {
-            for &ch_id in &requested_channels {
-                if accessible_channels.contains(&ch_id) {
-                    continue;
-                }
-                let token_allows = token_channel_ids
-                    .as_deref()
-                    .is_none_or(|allowed| allowed.contains(&ch_id));
-                let db_is_member = if token_allows {
-                    match state
-                        .db
-                        .is_member(conn.tenant.community(), ch_id, &pubkey_bytes)
-                        .await
-                    {
-                        Ok(member) => Some(member),
-                        Err(e) => {
-                            warn!(sub_id = %sub_id, "Channel membership confirmation failed: {e}");
-                            conn.send(RelayMessage::closed(&sub_id, "error: database error"));
-                            return;
-                        }
-                    }
-                } else {
-                    None
-                };
-                super::req::resolve_request_local_access(
-                    &mut accessible_channels,
-                    ch_id,
-                    token_allows,
-                    db_is_member,
-                );
+            let repaired_from = accessible_channels.len();
+            if let Err(e) = super::req::confirm_requested_channel_access(
+                &state,
+                conn.tenant.community(),
+                &pubkey_bytes,
+                &requested_channels,
+                token_channel_ids.as_deref(),
+                &mut accessible_channels,
+                &readable_system,
+            )
+            .await
+            {
+                warn!(sub_id = %sub_id, "Channel membership confirmation failed: {e}");
+                conn.send(RelayMessage::closed(&sub_id, "error: database error"));
+                return;
             }
+            if let Err(e) = super::system_channels::keep_repaired_system_channels_named(
+                &state,
+                conn.tenant.community(),
+                &mut accessible_channels,
+                repaired_from,
+                &mut readable_system,
+            )
+            .await
+            {
+                warn!(sub_id = %sub_id, "Failed to classify repaired channels: {e}");
+                conn.send(RelayMessage::closed(&sub_id, "error: database error"));
+                return;
+            }
+            let filter_scope = super::system_channels::filter_channel_scope(
+                filter,
+                &accessible_channels,
+                &readable_system,
+            );
+            let scope: HashSet<_> = filter_scope.iter().collect();
             let authorized_requested: Vec<_> = requested_channels
                 .iter()
                 .copied()
-                .filter(|channel_id| accessible_channels.contains(channel_id))
+                .filter(|channel_id| scope.contains(channel_id))
                 .collect();
             if authorized_requested.is_empty() {
                 continue;
@@ -219,12 +244,7 @@ pub async fn handle_count(
                 conn.tenant.community(),
             )
             .await;
-            super::req::apply_channel_scope_to_query(
-                &mut query,
-                filter,
-                ch_id,
-                &accessible_channels,
-            );
+            super::req::apply_channel_scope_to_query(&mut query, filter, ch_id, &filter_scope);
             // Shared-gated visibility pushdown: pre-filter the fallback
             // query_events candidate page before ORDER/LIMIT.
             if needs_shared_gate_filtering {
@@ -303,7 +323,14 @@ pub async fn handle_count(
                 conn.tenant.community(),
             )
             .await;
-            query.channel_ids = Some(accessible_channels.to_vec());
+            query.channel_ids = Some(
+                super::system_channels::filter_channel_scope(
+                    filter,
+                    &accessible_channels,
+                    &readable_system,
+                )
+                .into_owned(),
+            );
             // Shared-gated visibility pushdown for the fallback query_events path.
             if needs_shared_gate_filtering {
                 query.shared_gated_reader = Some(pubkey_bytes.clone());

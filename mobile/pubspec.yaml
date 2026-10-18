@@ -16,7 +16,6 @@ dependencies:
   characters: ^1.4.0
   hooks_riverpod: ^3.0.3
   flutter_hooks: ^0.21.3
-  lucide_icons_flutter: ^3.1.0
   http: ^1.4.0
   flutter_secure_storage: ^10.0.0
   flutter_svg: ^2.2.4
@@ -50,6 +49,7 @@ dependencies:
   local_auth: ^3.0.2
 
 dev_dependencies:
+  shared_preferences_platform_interface: ^2.4.2
   flutter_test:
     sdk: flutter
   flutter_lints: ^6.0.0
@@ -76,6 +76,9 @@ flutter:
     # desktop uses. Do not hand-edit.
     - assets/emoji/emoji-data.json
   fonts:
+    - family: BuzzTabler
+      fonts:
+        - asset: assets/fonts/TablerIcons.ttf
     - family: Inter
       fonts:
         - asset: assets/fonts/InterVariable.ttf

@@ -38,7 +38,7 @@ fn inspection(
 }
 
 async fn inspect(f: &Fixture, command: &AssignedBotCommand) -> Result<serde_json::Value> {
-    let mut tx = f.pool.begin().await?;
+    let mut tx = admitted(&f.pool, f.community).await?;
     let observation = inspect_in_transaction(&mut tx, command).await?;
     tx.commit().await?;
     Ok(observation)
@@ -139,6 +139,7 @@ async fn inspection_paginates_only_current_owner_channels_and_excludes_archived(
             None,
             &f.owner.public_key().to_bytes(),
             None,
+            &[],
         )
         .await
         .unwrap();

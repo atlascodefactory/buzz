@@ -1,0 +1,17 @@
+[package]
+name = "buzz-keyring-compat"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+keyring = { path = "../../../third_party/keyring" }
+keyring-core = "=1.0.0"
+old-store = { package = "zbus-secret-service-keyring-store", version = "=1.0.1", features = ["crypto-rust"] }
+new-store = { package = "dbus-secret-service-keyring-store", version = "=1.0.1", features = ["crypto-rust", "vendored"] }
+dbus-secret-service = { path = "../../../third_party/dbus-secret-service", features = ["crypto-rust", "vendored"] }
+
+[patch.crates-io]
+dbus-secret-service = { path = "../../../third_party/dbus-secret-service" }
