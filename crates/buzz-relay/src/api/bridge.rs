@@ -1525,6 +1525,21 @@ async fn query_events_authed(
     // skips and the `before_id` BAD_REQUEST are decided here, before any DB
     // work is issued (validation errors are deterministic client mistakes, so
     // surfacing them ahead of transient DB errors is strictly more predictable).
+    let hygiene_channels = crate::handlers::channel_hygiene::metadata_channels(
+        state,
+        tenant.community(),
+        &pubkey_bytes,
+        &filters,
+        None,
+    )
+    .await
+    .map_err(|e| internal_error(&format!("metadata authorization: {e}")))?;
+    let mut metadata_access = accessible_channels.clone();
+    for id in &hygiene_channels {
+        if !metadata_access.contains(id) {
+            metadata_access.push(*id);
+        }
+    }
     let mut catchall_queries: Vec<(usize, buzz_db::EventQuery, ReadRoute)> = Vec::new();
     for (idx, (raw, filter)) in raw_filters.iter().zip(filters.iter()).enumerate() {
         if handled.contains(&idx) {
@@ -1532,7 +1547,14 @@ async fn query_events_authed(
         }
 
         if let Some(ch_id) = extract_channel_from_filter(filter) {
-            if !accessible_channels.contains(&ch_id) {
+            if !crate::handlers::channel_hygiene::read_channels(
+                filter,
+                &accessible_channels,
+                &hygiene_channels,
+                &metadata_access,
+            )
+            .contains(&ch_id)
+            {
                 continue;
             }
         }
@@ -1559,7 +1581,12 @@ async fn query_events_authed(
             &mut query,
             filter,
             extract_channel_from_filter(filter),
-            &accessible_channels,
+            crate::handlers::channel_hygiene::read_channels(
+                filter,
+                &accessible_channels,
+                &hygiene_channels,
+                &metadata_access,
+            ),
         );
         if let Some(channel) = extract_buzz_channel(raw) {
             query.custom_tag = Some(("buzz-channel".into(), channel.into()));
@@ -1634,7 +1661,14 @@ async fn query_events_authed(
         match filter_events {
             Ok(stored_events) => {
                 for se in stored_events {
-                    if !event_in_accessible_channel(&se, &accessible_channels) {
+                    let hygiene_metadata = crate::handlers::channel_hygiene::metadata_only(filter)
+                        && se
+                            .channel_id
+                            .is_some_and(|id| hygiene_channels.contains(&id))
+                        && se.event.kind.as_u16() == 39000
+                        && se.event.pubkey == state.relay_keypair.public_key();
+                    if !event_in_accessible_channel(&se, &accessible_channels) && !hygiene_metadata
+                    {
                         continue;
                     }
                     if !buzz_core::filter::filters_match(std::slice::from_ref(filter), &se) {
