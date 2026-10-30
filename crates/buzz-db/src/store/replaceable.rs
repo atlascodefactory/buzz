@@ -410,7 +410,13 @@ impl Db {
         event: &nostr::Event,
         channel_id: Option<Uuid>,
     ) -> Result<(StoredEvent, bool)> {
-        let mut tx = self.begin_event_write_transaction(community_id).await?;
+        let mut tx = crate::begin_community_event_write_transaction_with_legacy_metrics(
+            &self.pool,
+            community_id,
+            observability::WriterOperation::EventWrite,
+        )
+        .await?;
+        tx.set_push_enqueue(self.push_enqueue.clone());
         let timer =
             observability::TransactionTimer::start(TransactionOperation::ReplaceAddressableEvent);
         timer
