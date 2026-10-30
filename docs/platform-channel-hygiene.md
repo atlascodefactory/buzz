@@ -24,7 +24,9 @@ This grants no message, canvas, search-content or member-list access. It grants
 no delete, membership, visibility, description, archive or TTL mutation. Existing
 channel owner/admin rights, including their existing deletion behavior, still
 apply independently. The agent does not become an Operator itself and cannot
-manage the operator roster. Token scopes and channel restrictions still apply.
+manage the operator roster. Token scopes and channel restrictions still apply. Authority-assigned bots also
+retain their assignment boundary: both bot and owner must remain channel
+members, even when that owner is an Operator.
 
 ## Existing commands
 

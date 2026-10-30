@@ -86,7 +86,7 @@ pub(crate) async fn metadata_channels(
     {
         return Ok(Vec::new());
     }
-    let mut ids = state.db.channel_hygiene_ids(community).await?;
+    let mut ids = state.db.channel_hygiene_ids(community, actor).await?;
     if let Some(allowed) = token_channels {
         ids.retain(|id| allowed.contains(id));
     }
@@ -144,6 +144,12 @@ pub(crate) async fn persist_rename(
         .db
         .begin_event_write_transaction(tenant.community())
         .await?;
+    buzz_db::channel::lock_rename_metadata(
+        &mut tx,
+        channel,
+        &state.relay_keypair.public_key().to_bytes(),
+    )
+    .await?;
     let (stored, inserted) =
         buzz_db::event::insert_event_in_transaction(&mut tx, event, Some(channel)).await?;
     let mut metadata = None;

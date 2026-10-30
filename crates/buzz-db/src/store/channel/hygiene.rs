@@ -8,13 +8,13 @@ use crate::{Db, DbError, Result};
 
 const MAX_HYGIENE_CHANNELS: i64 = 4096;
 
-/// Capture canonical metadata and reserve the same discovery coordinate used by
-/// ordinary publishers. The caller retains this lock through its atomic commit.
-pub async fn rename_metadata_snapshot(
+/// Reserve discovery before inserting the request: assigned event ingress may
+/// already lock the channel row, and discovery publishers refresh TTL at commit.
+pub async fn lock_rename_metadata(
     tx: &mut AdmittedTx,
     channel: Uuid,
     relay_pubkey: &[u8],
-) -> Result<(super::ChannelRecord, Vec<super::MemberRecord>, u64)> {
+) -> Result<()> {
     let community = tx.community();
     let lock = crate::replaceable::event_replacement_lock_key(
         community,
@@ -22,10 +22,24 @@ pub async fn rename_metadata_snapshot(
         relay_pubkey,
         Some(channel.as_bytes()),
     );
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(lock)
-        .execute(tx.conn())
-        .await?;
+    crate::observability::observe_advisory_lock(
+        crate::observability::LockType::Replacement,
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(lock)
+            .execute(tx.conn()),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Capture canonical metadata under the previously reserved discovery lock.
+pub async fn rename_metadata_snapshot(
+    tx: &mut AdmittedTx,
+    channel: Uuid,
+    relay_pubkey: &[u8],
+) -> Result<(super::ChannelRecord, Vec<super::MemberRecord>, u64)> {
+    let community = tx.community();
+    lock_rename_metadata(tx, channel, relay_pubkey).await?;
     let row = sqlx::query(
         "SELECT id, name, channel_type::text AS channel_type, visibility::text AS visibility, \
          description, canvas, created_by, created_at, updated_at, archived_at, deleted_at, \
@@ -76,7 +90,11 @@ pub async fn rename_metadata_snapshot(
 impl Db {
     /// Bounded non-DM channel IDs for a separately authorized metadata reader.
     /// Reads the writer: channel deletion/type changes must not lag authorization.
-    pub async fn channel_hygiene_ids(&self, community: CommunityId) -> Result<Vec<Uuid>> {
+    pub async fn channel_hygiene_ids(
+        &self,
+        community: CommunityId,
+        actor: &[u8],
+    ) -> Result<Vec<Uuid>> {
         let mut connection = crate::observability::acquire_writer(
             &self.pool,
             crate::observability::WriterOperation::Authorization,
@@ -84,9 +102,11 @@ impl Db {
         .await?;
         let ids = sqlx::query_scalar::<_, Uuid>(
             "SELECT id FROM channels WHERE community_id = $1 AND deleted_at IS NULL \
-             AND channel_type IN ('stream', 'forum') ORDER BY id LIMIT $2",
+             AND channel_type IN ('stream', 'forum') \
+             AND assigned_bot_access_allowed($1, $2, id) ORDER BY id LIMIT $3",
         )
         .bind(community.as_uuid())
+        .bind(actor)
         .bind(MAX_HYGIENE_CHANNELS + 1)
         .fetch_all(&mut *connection)
         .await?;
@@ -117,6 +137,11 @@ pub async fn rename_in_transaction(
     // Serialize hygiene plans within a community, without blocking other tenants.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(format!("buzz_channel_rename:{community}"))
+        .execute(tx.conn())
+        .await?;
+    // A concurrent TTL transition takes this key before updating the row.
+    sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))")
+        .bind(super::channel_ttl_lock_key(community, channel))
         .execute(tx.conn())
         .await?;
     let previous: String = sqlx::query_scalar(

@@ -754,3 +754,6 @@ async fn archived_channel_stays_read_only_and_existing_owner_can_unarchive() {
         "owner-allowed"
     );
 }
+
+#[path = "review_postgres_tests.rs"]
+mod review_postgres_tests;
