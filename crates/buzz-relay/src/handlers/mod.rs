@@ -6,6 +6,8 @@ pub mod assigned_bot;
 pub mod auth;
 /// Pure NIP-29 channel membership-authority decisions (kinds 9000/9001/9022).
 pub mod channel_authz;
+/// Narrow operator-owned-agent channel hygiene capabilities.
+pub(crate) mod channel_hygiene;
 /// Subscription close (CLOSE) handler.
 pub mod close;
 /// Command executor — transactional processing for command kinds.

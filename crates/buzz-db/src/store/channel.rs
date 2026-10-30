@@ -13,6 +13,9 @@ use crate::Db;
 use buzz_core::CommunityId;
 use buzz_datastore_tracing::datastore_span;
 
+mod hygiene;
+pub use hygiene::{lock_rename_metadata, rename_in_transaction, rename_metadata_snapshot};
+
 // Re-export the canonical enum definitions from buzz-core.
 // These live in core (zero I/O deps) so the SDK can share them
 // without pulling in sqlx/tokio.

@@ -653,6 +653,16 @@ pub async fn validate_admin_event(
             }
         }
         9002 => {
+            if event
+                .tags
+                .iter()
+                .any(|tag| tag.kind().to_string() == "expected-name")
+                && !super::channel_hygiene::rename_only(event)
+            {
+                return Err(anyhow::anyhow!(
+                    "expected-name requires a single name-only edit"
+                ));
+            }
             // EDIT_METADATA: require at least one recognized metadata tag.
             const RECOGNIZED_TAGS: &[&str] = &[
                 "name",
@@ -781,6 +791,18 @@ pub async fn validate_admin_event(
                             &actor_bytes,
                         )
                         .await?
+                        {
+                            return Ok(());
+                        }
+                        if matches!(channel.channel_type.as_str(), "stream" | "forum")
+                            && super::channel_hygiene::rename_only(event)
+                            && super::channel_hygiene::operator_owner(
+                                state,
+                                tenant.community(),
+                                &actor_bytes,
+                            )
+                            .await?
+                            .is_some()
                         {
                             return Ok(());
                         }
@@ -1274,6 +1296,84 @@ async fn dispatch_group_members_event(
     }
 }
 
+/// Canonical NIP-29 metadata wire shape, shared with atomic name edits.
+pub(crate) fn group_metadata_tags(
+    channel: &buzz_db::channel::ChannelRecord,
+    members: &[MemberRecord],
+) -> anyhow::Result<Vec<Tag>> {
+    let group_id = channel.id.to_string();
+    let mut tags: Vec<Tag> = vec![Tag::parse(["d", &group_id])?];
+    tags.push(Tag::parse(["name", &channel.name])?);
+    if let Some(ref desc) = channel.description {
+        if !desc.is_empty() {
+            tags.push(Tag::parse(["about", desc])?);
+        }
+    }
+    if channel.visibility == "private" {
+        tags.push(Tag::parse(["private"])?);
+    } else {
+        // Explicit "public" tag complements NIP-29's absence-of-"private" convention,
+        // making channel visibility self-describing for clients.
+        tags.push(Tag::parse(["public"])?);
+    }
+    // NIP-29 hidden tag: hide metadata from non-members. Set for DMs and
+    // for private system channels. Not a security boundary — access
+    // control is handled by channel-scoped storage.
+    if channel.channel_type == "system" && channel.visibility == "private" {
+        tags.push(Tag::parse(["hidden"])?);
+    }
+    if channel.channel_type == "dm" {
+        tags.push(Tag::parse(["hidden"])?);
+        // Include participant pubkeys in kind:39000 for DMs so clients can
+        // resolve display names without a separate kind:39002 fetch.
+        for m in members {
+            let pubkey_hex = hex::encode(&m.pubkey);
+            tags.push(Tag::parse(["p", &pubkey_hex])?);
+        }
+    }
+    // Buzz channels always require explicit membership
+    tags.push(Tag::parse(["closed"])?);
+    // Channel type tag so clients can distinguish stream/forum/dm without
+    // inference, then the creator. The same tags lead 39001 and 39002.
+    tags.extend(group_state_identity_tags(&channel.identity())?);
+    // Creation time, so readers can pick the oldest of two channels. The
+    // event's own created_at changes on every edit.
+    tags.push(buzz_core::channel::channel_created_at_tag(
+        channel.created_at.timestamp(),
+    )?);
+    // Optional topic / purpose for richer client UX
+    if let Some(ref topic) = channel.topic {
+        if !topic.is_empty() {
+            tags.push(Tag::parse(["topic", topic])?);
+        }
+    }
+    if let Some(ref purpose) = channel.purpose {
+        if !purpose.is_empty() {
+            tags.push(Tag::parse(["purpose", purpose])?);
+        }
+    }
+    // Archived state — clients use this to hide channels from the sidebar.
+    if channel.archived_at.is_some() {
+        tags.push(Tag::parse(["archived", "true"])?);
+    }
+    // Ephemeral channel TTL — clients use this to show countdown timers.
+    if let Some(ttl) = channel.ttl_seconds {
+        tags.push(Tag::parse(["ttl", &ttl.to_string()])?);
+    }
+    if let Some(ref deadline) = channel.ttl_deadline {
+        tags.push(Tag::parse(["ttl_deadline", &deadline.to_rfc3339()])?);
+    }
+    if matches!(channel.channel_type.as_str(), "stream" | "forum") {
+        tags.push(Tag::parse(["member-count", &members.len().to_string()])?);
+        let owners = members
+            .iter()
+            .filter(|member| member.role == "owner")
+            .count();
+        tags.push(Tag::parse(["owner-count", &owners.to_string()])?);
+    }
+    Ok(tags)
+}
+
 /// Emit NIP-29 group discovery events (39000, 39001, 39002) signed by the relay keypair.
 /// Called after group creation, metadata changes, or membership changes.
 /// Events are stored channel-scoped (`channel_id = Some(...)`) so that existing
@@ -1300,67 +1400,7 @@ pub async fn emit_group_discovery_events(
     let group_id = channel_id.to_string();
 
     {
-        let mut tags: Vec<Tag> = vec![Tag::parse(["d", &group_id])?];
-        tags.push(Tag::parse(["name", &channel.name])?);
-        if let Some(ref desc) = channel.description {
-            if !desc.is_empty() {
-                tags.push(Tag::parse(["about", desc])?);
-            }
-        }
-        if channel.visibility == "private" {
-            tags.push(Tag::parse(["private"])?);
-        } else {
-            // Explicit "public" tag complements NIP-29's absence-of-"private" convention,
-            // making channel visibility self-describing for clients.
-            tags.push(Tag::parse(["public"])?);
-        }
-        // NIP-29 hidden tag: hide metadata from non-members. Set for DMs and
-        // for private system channels. Not a security boundary — access
-        // control is handled by channel-scoped storage.
-        if channel.channel_type == "system" && channel.visibility == "private" {
-            tags.push(Tag::parse(["hidden"])?);
-        }
-        if channel.channel_type == "dm" {
-            tags.push(Tag::parse(["hidden"])?);
-            // Include participant pubkeys in kind:39000 for DMs so clients can
-            // resolve display names without a separate kind:39002 fetch.
-            for m in &members {
-                let pubkey_hex = hex::encode(&m.pubkey);
-                tags.push(Tag::parse(["p", &pubkey_hex])?);
-            }
-        }
-        // Buzz channels always require explicit membership
-        tags.push(Tag::parse(["closed"])?);
-        // Channel type tag so clients can distinguish stream/forum/dm without
-        // inference, then the creator. The same tags lead 39001 and 39002.
-        tags.extend(group_state_identity_tags(&channel.identity())?);
-        // Creation time, so readers can pick the oldest of two channels. The
-        // event's own created_at changes on every edit.
-        tags.push(buzz_core::channel::channel_created_at_tag(
-            channel.created_at.timestamp(),
-        )?);
-        // Optional topic / purpose for richer client UX
-        if let Some(ref topic) = channel.topic {
-            if !topic.is_empty() {
-                tags.push(Tag::parse(["topic", topic])?);
-            }
-        }
-        if let Some(ref purpose) = channel.purpose {
-            if !purpose.is_empty() {
-                tags.push(Tag::parse(["purpose", purpose])?);
-            }
-        }
-        // Archived state — clients use this to hide channels from the sidebar.
-        if channel.archived_at.is_some() {
-            tags.push(Tag::parse(["archived", "true"])?);
-        }
-        // Ephemeral channel TTL — clients use this to show countdown timers.
-        if let Some(ttl) = channel.ttl_seconds {
-            tags.push(Tag::parse(["ttl", &ttl.to_string()])?);
-        }
-        if let Some(ref deadline) = channel.ttl_deadline {
-            tags.push(Tag::parse(["ttl_deadline", &deadline.to_rfc3339()])?);
-        }
+        let tags = group_metadata_tags(&channel, &members)?;
         emit_addressable_discovery_event(
             tenant,
             state,
@@ -2654,7 +2694,7 @@ async fn handle_standard_deletion_event(
 }
 
 /// Extract channel UUID from `h` tag (NIP-29 group ID).
-fn extract_h_tag_channel(event: &Event) -> Option<Uuid> {
+pub(crate) fn extract_h_tag_channel(event: &Event) -> Option<Uuid> {
     for tag in event.tags.iter() {
         if tag.kind().to_string() == "h" {
             if let Some(val) = tag.content() {

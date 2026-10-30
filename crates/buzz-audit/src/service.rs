@@ -127,6 +127,48 @@ impl AuditService {
         Ok(audit_entry)
     }
 
+    /// Append an audit entry atomically with a community-admitted domain change.
+    /// The caller owns commit/rollback; no raw connection leaves the DB crate.
+    pub async fn log_in_transaction(
+        tx: &mut buzz_db::AdmittedTx,
+        entry: NewAuditEntry,
+    ) -> Result<AuditEntry, AuditError> {
+        if tx.community() != entry.community_id {
+            return Err(buzz_db::DbError::AccessDenied("audit community mismatch".into()).into());
+        }
+        let head = buzz_db::audit::lock_head(tx).await?;
+        let (seq, prev_hash) = head.map_or((1, None), |(seq, hash)| (seq + 1, Some(hash)));
+        let mut appended = AuditEntry {
+            community_id: *entry.community_id.as_uuid(),
+            seq,
+            hash_version: CURRENT_HASH_VERSION,
+            hash: Vec::new(),
+            prev_hash,
+            action: entry.action,
+            actor_pubkey: entry.actor_pubkey,
+            object_id: entry.object_id,
+            detail: entry.detail,
+            created_at: log_timestamp(),
+        };
+        appended.hash = compute_hash(&appended)?.to_vec();
+        buzz_db::audit::append(
+            tx,
+            buzz_db::audit::AuditAppend {
+                seq: appended.seq,
+                hash_version: appended.hash_version,
+                hash: &appended.hash,
+                prev_hash: appended.prev_hash.as_deref(),
+                action: appended.action.as_str(),
+                actor_pubkey: appended.actor_pubkey.as_deref(),
+                object_id: appended.object_id.as_deref(),
+                detail: &appended.detail,
+                created_at: appended.created_at,
+            },
+        )
+        .await?;
+        Ok(appended)
+    }
+
     /// Verify the hash chain for one community over `[from_seq, to_seq]`.
     ///
     /// Reads exactly that community's chain — it can never observe another

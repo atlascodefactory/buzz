@@ -3558,7 +3558,17 @@ async fn ingest_event_inner(
     };
 
     let workflow_deletion = crate::handlers::side_effects::is_workflow_deletion(&event);
-    let (stored_event, was_inserted) = if is_gift_wrap {
+    let plain_rename = crate::handlers::channel_hygiene::rename_only(&event);
+    let (stored_event, was_inserted) = if plain_rename {
+        crate::handlers::channel_hygiene::persist_rename(state, tenant, &event)
+            .await
+            .map_err(|e| match e.downcast_ref::<buzz_db::DbError>() {
+                Some(buzz_db::DbError::InvalidData(_) | buzz_db::DbError::NotFound(_)) => {
+                    IngestError::Rejected(format!("invalid: channel rename failed: {e}"))
+                }
+                _ => IngestError::Internal(format!("error: channel rename failed: {e}")),
+            })?
+    } else if is_gift_wrap {
         // NIP-59's outer signer is ephemeral; authorization belongs to the
         // authenticated actor. Keep both assignment fences through persistence.
         state
@@ -3676,7 +3686,10 @@ async fn ingest_event_inner(
         });
     }
 
-    if !workflow_deletion && crate::handlers::side_effects::is_side_effect_kind(kind_u32) {
+    if !plain_rename
+        && !workflow_deletion
+        && crate::handlers::side_effects::is_side_effect_kind(kind_u32)
+    {
         if let Err(e) =
             crate::handlers::side_effects::handle_side_effects(tenant, kind_u32, &event, state)
                 .await

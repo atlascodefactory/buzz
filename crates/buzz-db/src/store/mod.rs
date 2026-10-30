@@ -1,5 +1,8 @@
 //! Domain-owned persistence implementations.
 
+/// Transaction-bound audit-chain storage.
+pub mod audit;
+
 /// Explicit deployment-global admin report reads.
 pub mod admin_moderation;
 /// Community-scoped authentication allowlist persistence.
