@@ -200,6 +200,9 @@ run_unit_tests() {
   run_test_step "buzz-relay channel authorization tests" \
     cargo test -p buzz-relay --lib handlers::channel_authz:: -- --nocapture
 
+  run_test_step "buzz-relay channel hygiene filter tests" \
+    cargo test -p buzz-relay --lib handlers::channel_hygiene::tests:: -- --nocapture
+
   run_test_step "buzz-relay moderation authorization tests" \
     cargo test -p buzz-relay --lib handlers::moderation_authz:: -- --nocapture
 
