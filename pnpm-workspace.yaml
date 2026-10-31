@@ -18,10 +18,10 @@ overrides:
   # 5.0.1 / 5.0.2 respectively; pin >=5.0.2 to cover both. Removable once
   # markdown-it resolves linkify-it >=5.0.2 on its own.
   linkify-it: "^5.0.2"
-  # TanStack Router currently resolves seroval 1.5.4. Its untrusted JSON
-  # deserializer has a critical callable-invocation bug and a memory DoS;
-  # GitHub Security Lab identifies 1.6.4 as the fully patched 1.x floor.
-  seroval: "1.6.4"
+  # TanStack Router uses seroval for route state. The October 2026
+  # deserialization advisories GHSA-7rv5-mrxv-xcr9, GHSA-97r2-qh9m-474h,
+  # and GHSA-wp97-x4hv-qvhp affect <=1.6.7; keep the patched 1.x floor.
+  seroval: "1.6.8"
 patchedDependencies:
   isomorphic-git: patches/isomorphic-git.patch
   virtua@0.49.3: patches/virtua@0.49.3.patch
