@@ -69,6 +69,7 @@ buzz-media = { workspace = true }
 s3 = { version = "0.37", package = "rust-s3", default-features = false, features = ["tokio-rustls-tls", "fail-on-err", "tags"] }
 tempfile = "3"
 bytes = "1"
+http-body-util = "0.1"
 infer = "0.19"
 serde_yaml      = { workspace = true }
 sha2            = { workspace = true }
@@ -81,7 +82,7 @@ moka            = { workspace = true }
 metrics         = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 metrics-util    = { workspace = true }
-pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
+pulldown-cmark = { version = "0.13.6", default-features = false, features = ["html"] }
 async-compression = { version = "0.4.42", features = ["tokio", "gzip"] }
 
 [features]
@@ -98,7 +99,6 @@ ring = "0.17"
 # in settings_tests.rs (key-pairing build_router tests).
 jsonwebtoken = { version = "10.4.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 http-body = "1"
-http-body-util = "0.1"
 buzz-core = { workspace = true, features = ["test-utils"] }
 buzz-auth = { workspace = true, features = ["dev", "test-utils"] }
 reqwest = { workspace = true }
