@@ -377,6 +377,37 @@ impl Db {
         event: &nostr::Event,
         channel_id: Option<Uuid>,
     ) -> Result<(StoredEvent, bool)> {
+        let (mut tx, transaction_timer) = observability::begin_transaction(
+            &self.pool,
+            observability::TransactionOperation::ReplaceAddressableEvent,
+        )
+        .await?;
+        transaction_timer
+            .observe(async {
+                let result = self
+                    .replace_addressable_event_in_transaction(
+                        &mut tx,
+                        community_id,
+                        event,
+                        channel_id,
+                    )
+                    .await?;
+                tx.commit().await?;
+                Ok(result)
+            })
+            .await
+    }
+
+    /// Replace discovery state atomically with a caller-owned domain mutation.
+    /// The inner savepoint preserves the previous live head on stale/duplicate
+    /// input without rolling back unrelated work in the outer transaction.
+    pub async fn replace_addressable_event_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        community_id: CommunityId,
+        event: &nostr::Event,
+        channel_id: Option<Uuid>,
+    ) -> Result<(StoredEvent, bool)> {
         let kind_i32 = buzz_core::kind::event_kind_i32(event);
         let pubkey_bytes = event.pubkey.to_bytes();
         let created_at_secs = event.created_at.as_secs() as i64;
@@ -391,133 +422,111 @@ impl Db {
             channel_id.as_ref().map(|id| id.as_bytes().as_slice()),
         );
 
-        let (mut tx, transaction_timer) = observability::begin_transaction(
-            &self.pool,
-            observability::TransactionOperation::ReplaceAddressableEvent,
+        let mut tx = transaction.begin().await?;
+        // Serialize all writers for the same (kind, pubkey, channel_id) tuple.
+        // Advisory lock is transaction-scoped — released on commit/rollback.
+        observability::observe_advisory_lock(
+            observability::LockType::Replacement,
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(lock_key)
+                .execute(&mut *tx),
         )
         .await?;
 
-        transaction_timer
-            .observe(async {
-                // Serialize all writers for the same (kind, pubkey, channel_id) tuple.
-                // Advisory lock is transaction-scoped — released on commit/rollback.
-                observability::observe_advisory_lock(
-                    observability::LockType::Replacement,
-                    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                        .bind(lock_key)
-                        .execute(&mut *tx),
-                )
-                .await?;
+        // Check for the newest existing event. ORDER BY + LIMIT 1 is defensive against
+        // historical data where prior bugs may have left multiple live rows.
+        let existing: Option<(chrono::DateTime<chrono::Utc>, Vec<u8>)> = sqlx::query_as(
+            "SELECT created_at, id FROM events \
+                 WHERE community_id = $1 AND kind = $2 AND pubkey = $3 \
+                 AND channel_id IS NOT DISTINCT FROM $4 \
+                 AND deleted_at IS NULL \
+                 ORDER BY created_at DESC, id ASC LIMIT 1",
+        )
+        .bind(community_id.as_uuid())
+        .bind(kind_i32)
+        .bind(pubkey_bytes.as_slice())
+        .bind(channel_id)
+        .fetch_optional(&mut *tx)
+        .await?;
 
-                // Check for the newest existing event. ORDER BY + LIMIT 1 is defensive against
-                // historical data where prior bugs may have left multiple live rows.
-                let existing: Option<(chrono::DateTime<chrono::Utc>, Vec<u8>)> =
-                    sqlx::query_as(
-                        "SELECT created_at, id FROM events \
-                         WHERE community_id = $1 AND kind = $2 AND pubkey = $3 \
-                         AND channel_id IS NOT DISTINCT FROM $4 \
-                         AND deleted_at IS NULL \
-                         ORDER BY created_at DESC, id ASC LIMIT 1",
-                    )
-                    .bind(community_id.as_uuid())
-                    .bind(kind_i32)
-                    .bind(pubkey_bytes.as_slice())
-                    .bind(channel_id)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-
-                // Stale-write protection: reject if incoming is not newer.
-                // NIP-16: created_at is second-resolution. On same-second tie, lowest
-                // event id (lexicographic) wins — deterministic across relays.
-                let incoming_id = event.id.as_bytes().as_slice();
-                if let Some((existing_ts, existing_id)) = existing {
-                    let dominated = created_at < existing_ts
-                        || (created_at == existing_ts
-                            && incoming_id >= existing_id.as_slice());
-                    if dominated {
-                        tx.rollback().await?;
-                        let received_at = chrono::Utc::now();
-                        return Ok((
-                            StoredEvent::with_received_at(
-                                event.clone(),
-                                received_at,
-                                channel_id,
-                                false,
-                            ),
-                            false,
-                        ));
-                    }
-                }
-
-                // Soft-delete the old event (if any). IS NOT DISTINCT FROM for NULL safety.
-                sqlx::query(
-                    "UPDATE events SET deleted_at = NOW() \
-                     WHERE community_id = $1 AND kind = $2 AND pubkey = $3 \
-                     AND channel_id IS NOT DISTINCT FROM $4 \
-                     AND deleted_at IS NULL",
-                )
-                .bind(community_id.as_uuid())
-                .bind(kind_i32)
-                .bind(pubkey_bytes.as_slice())
-                .bind(channel_id)
-                .execute(&mut *tx)
-                .await?;
-
-                // Insert the new event inside the same transaction.
-                let sig_bytes = event.sig.serialize();
-                let tags_json = serde_json::to_value(&event.tags)?;
+        // Stale-write protection: reject if incoming is not newer.
+        // NIP-16: created_at is second-resolution. On same-second tie, lowest
+        // event id (lexicographic) wins — deterministic across relays.
+        let incoming_id = event.id.as_bytes().as_slice();
+        if let Some((existing_ts, existing_id)) = existing {
+            let dominated = created_at < existing_ts
+                || (created_at == existing_ts && incoming_id >= existing_id.as_slice());
+            if dominated {
+                tx.rollback().await?;
                 let received_at = chrono::Utc::now();
-                let d_tag = crate::event::extract_d_tag(event);
+                return Ok((
+                    StoredEvent::with_received_at(event.clone(), received_at, channel_id, false),
+                    false,
+                ));
+            }
+        }
 
-                let insert_result = sqlx::query(
-                    "INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id, d_tag) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
-                     ON CONFLICT DO NOTHING",
-                )
-                .bind(community_id.as_uuid())
-                .bind(event.id.as_bytes().as_slice())
-                .bind(pubkey_bytes.as_slice())
-                .bind(created_at)
-                .bind(kind_i32)
-                .bind(&tags_json)
-                .bind(&event.content)
-                .bind(sig_bytes.as_slice())
-                .bind(received_at)
-                .bind(channel_id)
-                .bind(d_tag.as_deref())
-                .execute(&mut *tx)
-                .await?;
+        // Soft-delete the old event (if any). IS NOT DISTINCT FROM for NULL safety.
+        sqlx::query(
+            "UPDATE events SET deleted_at = NOW() \
+             WHERE community_id = $1 AND kind = $2 AND pubkey = $3 \
+             AND channel_id IS NOT DISTINCT FROM $4 \
+             AND deleted_at IS NULL",
+        )
+        .bind(community_id.as_uuid())
+        .bind(kind_i32)
+        .bind(pubkey_bytes.as_slice())
+        .bind(channel_id)
+        .execute(&mut *tx)
+        .await?;
 
-                let was_inserted = insert_result.rows_affected() > 0;
-                if !was_inserted {
-                    // ON CONFLICT fired — the event ID already exists. Rollback the
-                    // soft-delete so we don't lose the previous replaceable event.
-                    tx.rollback().await?;
-                    return Ok((
-                        StoredEvent::with_received_at(
-                            event.clone(),
-                            received_at,
-                            channel_id,
-                            false,
-                        ),
-                        false,
-                    ));
-                }
+        // Insert the new event inside the same transaction.
+        let sig_bytes = event.sig.serialize();
+        let tags_json = serde_json::to_value(&event.tags)?;
+        let received_at = chrono::Utc::now();
+        let d_tag = crate::event::extract_d_tag(event);
 
-                // The replaceable event and its denormalized mention index are one
-                // authoritative discovery write. An indexing error must roll back the
-                // new event and restore the previously-live event.
-                crate::insert_mentions_in_transaction(&mut tx, community_id, event, channel_id)
-                    .await?;
+        let insert_result = sqlx::query(
+            "INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id, d_tag) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(community_id.as_uuid())
+        .bind(event.id.as_bytes().as_slice())
+        .bind(pubkey_bytes.as_slice())
+        .bind(created_at)
+        .bind(kind_i32)
+        .bind(&tags_json)
+        .bind(&event.content)
+        .bind(sig_bytes.as_slice())
+        .bind(received_at)
+        .bind(channel_id)
+        .bind(d_tag.as_deref())
+        .execute(&mut *tx)
+        .await?;
 
-                tx.commit().await?;
+        let was_inserted = insert_result.rows_affected() > 0;
+        if !was_inserted {
+            // ON CONFLICT fired — the event ID already exists. Rollback the
+            // soft-delete so we don't lose the previous replaceable event.
+            tx.rollback().await?;
+            return Ok((
+                StoredEvent::with_received_at(event.clone(), received_at, channel_id, false),
+                false,
+            ));
+        }
 
-                Ok((
-                    StoredEvent::with_received_at(event.clone(), received_at, channel_id, true),
-                    true,
-                ))
-            })
-            .await
+        // The replaceable event and its denormalized mention index are one
+        // authoritative discovery write. An indexing error must roll back the
+        // new event and restore the previously-live event.
+        crate::insert_mentions_in_transaction(&mut tx, community_id, event, channel_id).await?;
+
+        tx.commit().await?;
+
+        Ok((
+            StoredEvent::with_received_at(event.clone(), received_at, channel_id, true),
+            true,
+        ))
     }
 
     /// Replace a NIP-33 event inside a caller-owned transaction.

@@ -187,6 +187,31 @@ pub async fn handle_req(
         }
     }
 
+    let hygiene_channels = match super::channel_hygiene::metadata_channels(
+        &state,
+        conn.tenant.community(),
+        &pubkey_bytes,
+        &filters,
+        token_channel_ids.as_deref(),
+    )
+    .await
+    {
+        Ok(ids) => ids,
+        Err(e) => {
+            warn!("Channel hygiene authorization failed: {e}");
+            conn.send(RelayMessage::closed(
+                &sub_id,
+                "error: metadata authorization unavailable",
+            ));
+            return;
+        }
+    };
+    let mut metadata_access = accessible_channels.clone();
+    for id in &hygiene_channels {
+        if !metadata_access.contains(id) {
+            metadata_access.push(*id);
+        }
+    }
     let authorized_requested_channels = requested_channel_ids.as_ref().map(|requested| {
         requested
             .iter()
@@ -201,6 +226,13 @@ pub async fn handle_req(
     if authorized_requested_channels
         .as_ref()
         .is_some_and(|authorized| authorized.is_empty())
+        && !filters.iter().any(|filter| {
+            super::channel_hygiene::metadata_only(filter)
+                && extract_channel_ids_from_filters(std::slice::from_ref(filter))
+                    .map_or(!hygiene_channels.is_empty(), |ids| {
+                        ids.iter().any(|id| hygiene_channels.contains(id))
+                    })
+        })
     {
         conn.send(RelayMessage::closed(
             &sub_id,
@@ -351,7 +383,11 @@ pub async fn handle_req(
                             None
                         }
                     })
-                    .or(channel_id)
+                    .or(if super::channel_hygiene::metadata_only(filter) {
+                        None
+                    } else {
+                        channel_id
+                    })
             };
             let mut params =
                 filter_to_query_params(filter, per_filter_channel, conn.tenant.community());
@@ -360,7 +396,12 @@ pub async fn handle_req(
                 &mut params,
                 filter,
                 per_filter_channel,
-                &accessible_channels,
+                super::channel_hygiene::read_channels(
+                    filter,
+                    &accessible_channels,
+                    &hygiene_channels,
+                    &metadata_access,
+                ),
             );
             // Shared-gated visibility pushdown: set reader bytes so query_events
             // appends the SQL visibility clause before ORDER/LIMIT, preventing
@@ -451,7 +492,11 @@ pub async fn handle_req(
             }
 
             if let Some(ch_id) = stored.channel_id {
-                if !accessible_channels.contains(&ch_id) {
+                let hygiene_metadata = super::channel_hygiene::metadata_only(filter)
+                    && hygiene_channels.contains(&ch_id)
+                    && stored.event.kind.as_u16() == 39000
+                    && stored.event.pubkey == state.relay_keypair.public_key();
+                if !accessible_channels.contains(&ch_id) && !hygiene_metadata {
                     continue;
                 }
             }

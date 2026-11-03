@@ -414,6 +414,28 @@ pub async fn is_agent_owner(
     Ok(row.unwrap_or(false))
 }
 
+/// Read the verified, first-write-wins owner binding on the authorization writer.
+/// Profile claims are deliberately not an ownership credential.
+pub async fn get_agent_owner(
+    pool: &PgPool,
+    community_id: CommunityId,
+    pubkey: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    let mut connection = crate::observability::acquire_writer(
+        pool,
+        crate::observability::WriterOperation::Authorization,
+    )
+    .await?;
+    Ok(sqlx::query_scalar::<_, Option<Vec<u8>>>(
+        "SELECT agent_owner_pubkey FROM users WHERE community_id = $1 AND pubkey = $2",
+    )
+    .bind(community_id.as_uuid())
+    .bind(pubkey)
+    .fetch_optional(&mut *connection)
+    .await?
+    .flatten())
+}
+
 /// Set the channel_add_policy for a user.
 /// Returns an error if the pubkey is not found (rows_affected == 0).
 /// Returns an error if `policy` is not one of the valid ENUM values.
@@ -566,6 +588,15 @@ impl Db {
         pubkey: &[u8],
     ) -> Result<Option<(String, Option<Vec<u8>>)>> {
         crate::user::get_agent_channel_policy(&self.pool, community_id, pubkey).await
+    }
+
+    /// Read a verified owner binding from the authorization writer.
+    pub async fn get_agent_owner(
+        &self,
+        community_id: CommunityId,
+        pubkey: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        get_agent_owner(&self.pool, community_id, pubkey).await
     }
 
     /// Check whether `actor_pubkey` is the agent owner of `target_pubkey`.

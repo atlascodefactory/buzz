@@ -1359,7 +1359,7 @@ async fn get_users_bulk_with_operation(
     Ok(out)
 }
 
-fn row_to_member_record(row: sqlx::postgres::PgRow) -> Result<MemberRecord> {
+pub(crate) fn row_to_member_record(row: sqlx::postgres::PgRow) -> Result<MemberRecord> {
     let channel_id: Uuid = row.try_get("channel_id")?;
 
     Ok(MemberRecord {

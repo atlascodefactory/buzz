@@ -90,7 +90,29 @@ impl AuditService {
         entry: NewAuditEntry,
     ) -> Result<AuditEntry, AuditError> {
         let mut tx = conn.begin().await?;
+        let appended = Self::append_in_transaction(&mut tx, entry).await?;
+        tx.commit().await?;
+        Ok(appended)
+    }
 
+    /// Append an audit entry atomically with a caller-owned domain mutation.
+    /// The transaction lock shares the existing session-lock namespace; normal
+    /// audit writers and transactional writers therefore use the same chain.
+    pub async fn log_in_transaction(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        entry: NewAuditEntry,
+    ) -> Result<AuditEntry, AuditError> {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("{AUDIT_LOCK_NAMESPACE}{}", entry.community_id))
+            .execute(&mut **tx)
+            .await?;
+        Self::append_in_transaction(tx, entry).await
+    }
+
+    async fn append_in_transaction(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        entry: NewAuditEntry,
+    ) -> Result<AuditEntry, AuditError> {
         // The stored row keys on the raw UUID; the typed `CommunityId` on the
         // input is the provenance fence, dereferenced here at the DB boundary.
         let community_id = *entry.community_id.as_uuid();
@@ -102,7 +124,7 @@ impl AuditService {
              ORDER BY seq DESC LIMIT 1",
         )
         .bind(community_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?;
 
         let (prev_seq, prev_hash): (i64, Option<Vec<u8>>) = match head {
@@ -150,10 +172,8 @@ impl AuditService {
         .bind(&audit_entry.detail)
         .bind(audit_entry.created_at)
         .bind(audit_entry.hash_version)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-
-        tx.commit().await?;
 
         Ok(audit_entry)
     }
