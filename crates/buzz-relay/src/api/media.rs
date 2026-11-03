@@ -28,6 +28,9 @@ use buzz_media::{
 
 use crate::state::AppState;
 
+#[path = "media_upload_policy.rs"]
+mod upload_policy;
+
 /// Lightweight pre-auth upload context: tenant + route mode only.
 ///
 /// Used as the first-phase extractor for `upload_blob`. Blossom auth
@@ -470,11 +473,25 @@ async fn upload_blob_result(
                 replay_chunks.push(chunk);
             }
             Some(Err(error)) => {
-                return Err(media_denial(MediaError::Io(error.to_string()), strictness))
+                let max = if state.config.media_images_only {
+                    state.config.media.max_image_bytes
+                } else {
+                    state
+                        .config
+                        .media
+                        .max_image_bytes
+                        .max(state.config.media.max_video_bytes)
+                };
+                return Err(media_denial(
+                    upload_policy::body_read_error(error, max),
+                    strictness,
+                ));
             }
             None => break,
         }
     }
+    upload_policy::check_image_upload(&sniff, state.config.media_images_only)
+        .map_err(|error| media_denial(error, strictness))?;
     let replay = futures_util::stream::iter(replay_chunks.into_iter().map(Ok)).chain(source);
 
     serving_write
@@ -485,70 +502,76 @@ async fn upload_blob_result(
 
     let mut descriptor = serving_write
         .protect(async {
-            Ok(if should_stream_as_video(&sniff) {
-                // Video path: stream body directly to disk — never fully buffered in RAM.
-                let content_length = headers
-                    .get("content-length")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok());
-                buzz_media::process_video_upload(
-                    &state.media_storage,
-                    &state.config.media,
-                    &auth.tenant,
-                    &auth.auth_event,
-                    replay,
-                    content_length,
-                    attribution,
-                )
-                .await?
-            } else {
-                // Non-video path: buffer the body (bounded by the larger of the image
-                // and generic-file caps), then decide image-vs-generic by sniffed MIME.
-                // Images go through the thumbnailing pipeline; non-media attachments
-                // (docs, archives, text, data) take the generic file path and are
-                // served as downloads. Recognized audio/video cannot fall through it.
-                let max = state
-                    .config
-                    .media
-                    .max_image_bytes
-                    .max(state.config.media.max_file_bytes);
-                let bytes =
-                    axum::body::to_bytes(axum::body::Body::from_stream(replay), max as usize)
-                        .await
-                        .map_err(|_| MediaError::FileTooLarge { size: 0, max })?;
-
-                let is_image = matches!(
-                    infer::get(&bytes).map(|t| t.mime_type()),
-                    Some("image/jpeg" | "image/png" | "image/gif" | "image/webp")
-                );
-
-                if is_image {
-                    buzz_media::process_upload(
+            Ok(
+                if !state.config.media_images_only && should_stream_as_video(&sniff) {
+                    // Video path: stream body directly to disk — never fully buffered in RAM.
+                    let content_length = headers
+                        .get("content-length")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok());
+                    buzz_media::process_video_upload(
                         &state.media_storage,
                         &state.config.media,
                         &auth.tenant,
                         &auth.auth_event,
-                        bytes,
+                        replay,
+                        content_length,
                         attribution,
                     )
                     .await?
-                } else if auth.route_mode == UploadRouteMode::LegacyMedia {
-                    let mime = infer::get(&bytes)
-                        .map(|kind| kind.mime_type().to_string())
-                        .unwrap_or_else(|| "application/octet-stream".to_string());
-                    return Err(MediaError::DisallowedContentType(mime));
                 } else {
-                    buzz_media::process_file_upload(
-                        &state.media_storage,
-                        &state.config.media,
-                        &auth.tenant,
-                        &auth.auth_event,
-                        bytes,
-                        attribution,
-                    )
-                    .await?
-                }
-            })
+                    // Non-video path: buffer the body (bounded by the larger of the image
+                    // and generic-file caps), then decide image-vs-generic by sniffed MIME.
+                    // Images go through the thumbnailing pipeline; non-media attachments
+                    // (docs, archives, text, data) take the generic file path and are
+                    // served as downloads. Recognized audio/video cannot fall through it.
+                    let max = if state.config.media_images_only {
+                        state.config.media.max_image_bytes
+                    } else {
+                        state
+                            .config
+                            .media
+                            .max_image_bytes
+                            .max(state.config.media.max_file_bytes)
+                    };
+                    let bytes =
+                        axum::body::to_bytes(axum::body::Body::from_stream(replay), max as usize)
+                            .await
+                            .map_err(|_| MediaError::FileTooLarge { size: 0, max })?;
+
+                    let is_image = matches!(
+                        infer::get(&bytes).map(|t| t.mime_type()),
+                        Some("image/jpeg" | "image/png" | "image/gif" | "image/webp")
+                    );
+
+                    if is_image {
+                        buzz_media::process_upload(
+                            &state.media_storage,
+                            &state.config.media,
+                            &auth.tenant,
+                            &auth.auth_event,
+                            bytes,
+                            attribution,
+                        )
+                        .await?
+                    } else if auth.route_mode == UploadRouteMode::LegacyMedia {
+                        let mime = infer::get(&bytes)
+                            .map(|kind| kind.mime_type().to_string())
+                            .unwrap_or_else(|| "application/octet-stream".to_string());
+                        return Err(MediaError::DisallowedContentType(mime));
+                    } else {
+                        buzz_media::process_file_upload(
+                            &state.media_storage,
+                            &state.config.media,
+                            &auth.tenant,
+                            &auth.auth_event,
+                            bytes,
+                            attribution,
+                        )
+                        .await?
+                    }
+                },
+            )
         })
         .await
         .map_err(|error| {
@@ -2095,6 +2118,7 @@ mod tests {
     // [FI-TRACE-AUTHORITY-UNIFORM, FI-INV-15]
     #[cfg(test)]
     mod postgres_tests {
+        include!("media_images_only_tests.rs");
         #[tokio::test]
         #[ignore = "requires Postgres"]
         async fn media_reads_reject_unauthenticated_get_and_head_before_sidecar_gate() {

@@ -278,11 +278,15 @@ fn nip_fi_guard_exempts(state: &AppState, request: &Request<Body>) -> bool {
 /// Pure Nostr protocol: WebSocket (NIP-01), HTTP bridge (NIP-98), media (Blossom),
 /// git (smart HTTP), NIP-05, and health probes.
 pub fn build_router(state: Arc<AppState>) -> Router {
-    let media_body_limit = state
-        .config
-        .media
-        .max_image_bytes
-        .max(state.config.media.max_video_bytes) as usize;
+    let media_body_limit = if state.config.media_images_only {
+        state.config.media.max_image_bytes
+    } else {
+        state
+            .config
+            .media
+            .max_image_bytes
+            .max(state.config.media.max_video_bytes)
+    } as usize;
     let media_router = Router::new()
         .route("/upload", put(api::media::upload_blob))
         .route("/media/upload", put(api::media::upload_blob))

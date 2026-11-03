@@ -318,6 +318,9 @@ pub struct Config {
 
     /// Media storage configuration (S3/MinIO).
     pub media: buzz_media::MediaConfig,
+    /// Restrict direct Blossom uploads to JPEG, PNG, GIF and WebP images.
+    /// Existing downloads and independent Git storage are unaffected.
+    pub media_images_only: bool,
     /// Independent Git S3 settings; absent means use the current media settings.
     pub git_storage: Option<GitStorageConfig>,
     /// Maximum concurrent media uploads handled by one relay process.
@@ -1024,6 +1027,7 @@ impl Config {
                 .map(|s| s.trim().to_lowercase())
                 .filter(|s| !s.is_empty()),
         };
+        let media_images_only = parse_bool("BUZZ_MEDIA_IMAGES_ONLY", false)?;
         let media_max_concurrent_uploads: usize =
             std::env::var("BUZZ_MEDIA_MAX_CONCURRENT_UPLOADS")
                 .ok()
@@ -1444,6 +1448,7 @@ impl Config {
             allow_nip_oa_auth,
             klipy,
             media,
+            media_images_only,
             git_storage,
             media_max_concurrent_uploads,
             media_max_concurrent_uploads_per_pubkey,
@@ -2449,6 +2454,30 @@ mod tests {
         } else {
             std::env::remove_var("BUZZ_AUDIT_ENABLED");
         }
+    }
+
+    #[test]
+    fn media_images_only_is_opt_in_and_rejects_invalid_configuration() {
+        let _guards = env_guards();
+        let previous = std::env::var_os("BUZZ_MEDIA_IMAGES_ONLY");
+        std::env::remove_var("BUZZ_MEDIA_IMAGES_ONLY");
+        let default = Config::from_env().map(|c| c.media_images_only);
+        std::env::set_var("BUZZ_MEDIA_IMAGES_ONLY", "true");
+        let enabled = Config::from_env().map(|c| c.media_images_only);
+        std::env::set_var("BUZZ_MEDIA_IMAGES_ONLY", "false");
+        let disabled = Config::from_env().map(|c| c.media_images_only);
+        std::env::set_var("BUZZ_MEDIA_IMAGES_ONLY", "sometimes");
+        let invalid = Config::from_env();
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_MEDIA_IMAGES_ONLY", value);
+        } else {
+            std::env::remove_var("BUZZ_MEDIA_IMAGES_ONLY");
+        }
+        assert!(!default.expect("default config"));
+        assert!(enabled.expect("enabled config"));
+        assert!(!disabled.expect("disabled config"));
+        assert!(matches!(invalid, Err(ConfigError::InvalidValue(message))
+            if message.contains("BUZZ_MEDIA_IMAGES_ONLY")));
     }
 
     #[test]
