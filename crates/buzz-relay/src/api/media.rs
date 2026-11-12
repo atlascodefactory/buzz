@@ -426,6 +426,11 @@ pub(crate) async fn upload_blob(
     upload_blob_inner(state, auth, headers, body).await
 }
 
+/// Largest request body either upload route may have to read.
+pub(crate) fn upload_body_limit(config: &crate::config::Config) -> u64 {
+    upload_policy::request_body_limit(&config.media, config.media_images_only)
+}
+
 async fn upload_blob_inner(
     state: Arc<AppState>,
     auth: AuthenticatedUpload,
@@ -473,24 +478,15 @@ async fn upload_blob_result(
                 replay_chunks.push(chunk);
             }
             Some(Err(error)) => {
-                let max = if state.config.media_images_only {
-                    state.config.media.max_image_bytes
-                } else {
-                    state
-                        .config
-                        .media
-                        .max_image_bytes
-                        .max(state.config.media.max_video_bytes)
-                };
                 return Err(media_denial(
-                    upload_policy::body_read_error(error, max),
+                    upload_policy::body_read_error(error, upload_body_limit(&state.config)),
                     strictness,
                 ));
             }
             None => break,
         }
     }
-    upload_policy::check_image_upload(&sniff, state.config.media_images_only)
+    let admitted = upload_policy::admit_upload(&sniff, state.config.media_images_only)
         .map_err(|error| media_denial(error, strictness))?;
     let replay = futures_util::stream::iter(replay_chunks.into_iter().map(Ok)).chain(source);
 
@@ -525,19 +521,12 @@ async fn upload_blob_result(
                     // Images go through the thumbnailing pipeline; non-media attachments
                     // (docs, archives, text, data) take the generic file path and are
                     // served as downloads. Recognized audio/video cannot fall through it.
-                    let max = if state.config.media_images_only {
-                        state.config.media.max_image_bytes
-                    } else {
-                        state
-                            .config
-                            .media
-                            .max_image_bytes
-                            .max(state.config.media.max_file_bytes)
-                    };
+                    let max = admitted.buffer_limit(&state.config.media);
                     let bytes =
                         axum::body::to_bytes(axum::body::Body::from_stream(replay), max as usize)
                             .await
                             .map_err(|_| MediaError::FileTooLarge { size: 0, max })?;
+                    upload_policy::confirm_upload(&bytes, admitted)?;
 
                     let is_image = matches!(
                         infer::get(&bytes).map(|t| t.mime_type()),

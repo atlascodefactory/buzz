@@ -318,7 +318,9 @@ pub struct Config {
 
     /// Media storage configuration (S3/MinIO).
     pub media: buzz_media::MediaConfig,
-    /// Restrict direct Blossom uploads to JPEG, PNG, GIF and WebP images.
+    /// Restrict direct Blossom uploads to JPEG, PNG, GIF and WebP images and
+    /// PDF documents. The name predates the PDF allowance; the environment
+    /// variable is kept so deployed configuration stays valid.
     /// Existing downloads and independent Git storage are unaffected.
     pub media_images_only: bool,
     /// Independent Git S3 settings; absent means use the current media settings.

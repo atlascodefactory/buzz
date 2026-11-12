@@ -1300,6 +1300,7 @@ dependencies = [
  "buzz-search",
  "buzz-workflow",
  "bytes",
+ "cfb",
  "chrono",
  "dashmap",
  "deadpool-redis",

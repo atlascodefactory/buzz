@@ -1,26 +1,45 @@
-# Direct image uploads and planned Drive folders
+# Direct image and PDF uploads and planned Drive folders
 
 ## Relay upload policy
 
 Set `BUZZ_MEDIA_IMAGES_ONLY=true` on the relay to accept only JPEG, PNG,
-GIF and WebP at both `PUT /upload` and `PUT /media/upload`. The default is
-`false`, preserving the upstream attachment behavior for other deployments.
-Invalid flag values fail startup. The official clients need no modification.
+GIF and WebP images and PDF documents as direct uploads. The variable name
+predates the PDF allowance (decided 2026-11-12) and is kept so prepared
+deployment configuration stays valid. The default is `false`, preserving the
+upstream attachment behavior for other deployments. Invalid flag values fail
+startup. The official clients need no modification.
 
 Admission uses the actual bytes, before selecting the video or generic-file
 pipeline. Filename extensions and request Content-Type cannot grant admission.
-The existing image decoder, dimension checks, hash verification, authentication,
-rate limits and image/GIF size limits still apply. Rejected attachments return
-HTTP 415 with a message asking the user to upload the file to Google Drive and
-share its link. The unchanged client controls the presentation of that error.
-PDFs, Office documents, archives, SVG, audio and video (including voice notes)
-cannot be uploaded directly when this policy is enabled. External links remain
-ordinary messages; this policy does not restrict links to a particular provider.
 
-The request and buffering limits use the image cap in this mode. Existing blobs
-remain downloadable under the existing authorization rules. Git object storage
-is independent and is not restricted by this attachment policy. This setting
-does not delete files, move them to Drive, or retroactively reject old messages.
+- Images are accepted at both `PUT /upload` and `PUT /media/upload`. The
+  existing image decoder, dimension checks and image/GIF size limits apply.
+- PDFs are accepted at `PUT /upload`, the route the official clients use. The
+  legacy `/media/upload` alias keeps its upstream media-only contract and
+  answers 415 for a PDF. A PDF must start with `%PDF-<major>.<minor>` at byte
+  zero and carry `%%EOF` within its final 1024 bytes. It is stored unchanged
+  through the generic-file pipeline, capped by `BUZZ_MAX_FILE_BYTES` (default
+  100 MB), and served as a download (`Content-Disposition: attachment`), never
+  rendered inline by the relay.
+- Hash verification, authentication and rate limits apply to both kinds.
+
+Rejected attachments return HTTP 415 with a message asking the user to upload
+the file to Google Drive and share its link. The unchanged client controls the
+presentation of that error. Word, Excel and PowerPoint files (`.docx`, `.xlsx`,
+`.pptx` are ZIP containers; `.doc`, `.xls`, `.ppt` are OLE2 containers), other
+archives, Markdown, HTML and plain text, SVG, audio and video (including voice
+notes) cannot be uploaded directly when this policy is enabled. Renaming such a
+file to `.pdf` or declaring it `application/pdf` does not admit it. The PDF
+check is structural, not a full parse: it keeps other formats out, but it does
+not validate, sanitize or scan PDF content. External links remain ordinary
+messages; this policy does not restrict links to a particular provider.
+
+The request limit is the larger of the image and generic-file caps in this
+mode; once the first bytes identify the kind, buffering uses that kind's own
+cap. Existing blobs remain downloadable under the existing authorization rules.
+Git object storage is independent and is not restricted by this attachment
+policy. This setting does not delete files, move them to Drive, or
+retroactively reject old messages.
 
 Deployment requires the tested relay revision plus the flag in the effective
 production Compose configuration. A source change alone does not enable it.
