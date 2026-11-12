@@ -35,6 +35,7 @@ mod image_policy_postgres_tests {
         bodies.extend(
             [
                 ("pdf-prefixed docx", pdf_prefixed_docx.as_slice()),
+                ("pdf-wrapped docx", fixtures::pdf_wrapped_docx(0).as_slice()),
                 ("pdf signature only", b"%PDF-1.7\nnot a document"),
                 ("pdf without version", b"%PDF\n%%EOF\n"),
                 ("zip", b"PK\x03\x04not an image"),

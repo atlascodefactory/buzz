@@ -17,7 +17,9 @@ pipeline. Filename extensions and request Content-Type cannot grant admission.
 - PDFs are accepted at `PUT /upload`, the route the official clients use. The
   legacy `/media/upload` alias keeps its upstream media-only contract and
   answers 415 for a PDF. A PDF must start with `%PDF-<major>.<minor>` at byte
-  zero and carry `%%EOF` within its final 1024 bytes. It is stored unchanged
+  zero, carry `%%EOF` within its final 1024 bytes, and must not end in a ZIP
+  directory (which is how a Word, Excel or PowerPoint file wrapped in PDF
+  markers would still open as an Office document). It is stored unchanged
   through the generic-file pipeline, capped by `BUZZ_MAX_FILE_BYTES` (default
   100 MB), and served as a download (`Content-Disposition: attachment`), never
   rendered inline by the relay.
@@ -30,8 +32,9 @@ presentation of that error. Word, Excel and PowerPoint files (`.docx`, `.xlsx`,
 archives, Markdown, HTML and plain text, SVG, audio and video (including voice
 notes) cannot be uploaded directly when this policy is enabled. Renaming such a
 file to `.pdf` or declaring it `application/pdf` does not admit it. The PDF
-check is structural, not a full parse: it keeps other formats out, but it does
-not validate, sanitize or scan PDF content. External links remain ordinary
+check is structural, not a full parse: it keeps Office and other formats out,
+but it does not validate, sanitize or scan PDF content, and it does not detect
+arbitrary non-ZIP data placed between valid PDF markers. External links remain ordinary
 messages; this policy does not restrict links to a particular provider.
 
 The request limit is the larger of the image and generic-file caps in this
