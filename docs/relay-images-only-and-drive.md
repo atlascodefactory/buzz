@@ -17,9 +17,11 @@ pipeline. Filename extensions and request Content-Type cannot grant admission.
 - PDFs are accepted at `PUT /upload`, the route the official clients use. The
   legacy `/media/upload` alias keeps its upstream media-only contract and
   answers 415 for a PDF. A PDF must start with `%PDF-<major>.<minor>` at byte
-  zero, carry `%%EOF` within its final 1024 bytes, and must not end in a ZIP
-  directory (which is how a Word, Excel or PowerPoint file wrapped in PDF
-  markers would still open as an Office document). It is stored unchanged
+  zero, carry `%%EOF` within its final 1024 bytes, and must not contain a ZIP
+  entry header anywhere (which is how a Word, Excel or PowerPoint file wrapped
+  in PDF markers would still open, or be repaired, as an Office document). A
+  PDF with an uncompressed embedded ZIP attachment is refused by the same
+  rule. It is stored unchanged
   through the generic-file pipeline, capped by `BUZZ_MAX_FILE_BYTES` (default
   100 MB), and served as a download (`Content-Disposition: attachment`), never
   rendered inline by the relay.

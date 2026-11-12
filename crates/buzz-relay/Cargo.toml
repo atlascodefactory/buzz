@@ -71,6 +71,7 @@ tempfile = "3"
 bytes = "1"
 http-body-util = "0.1"
 infer = "0.19"
+memchr = "2"
 serde_yaml      = { workspace = true }
 sha2            = { workspace = true }
 hmac            = { workspace = true }

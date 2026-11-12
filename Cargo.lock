@@ -1313,6 +1313,7 @@ dependencies = [
  "http-body-util",
  "infer",
  "jsonwebtoken",
+ "memchr",
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-util",

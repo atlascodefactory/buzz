@@ -67,7 +67,7 @@ pub(super) fn admit_upload(prefix: &[u8], images_only: bool) -> Result<Admitted,
 /// Re-check the complete buffered body against the kind admitted from the
 /// probe, so the generic-file pipeline can only ever receive a PDF under this
 /// policy. A PDF signature alone is not enough: the body must also end like a
-/// PDF and must not double as a ZIP archive, which is how an Office document
+/// PDF and must not contain a ZIP archive, which is how an Office document
 /// could otherwise travel behind a PDF header.
 pub(super) fn confirm_upload(body: &[u8], admitted: Admitted) -> Result<(), MediaError> {
     if admitted == Admitted::Any {
@@ -79,8 +79,8 @@ pub(super) fn confirm_upload(body: &[u8], admitted: Admitted) -> Result<(), Medi
     if admitted == Admitted::Pdf && !has_pdf_end_marker(body) {
         return Err(denied("application/pdf without an end-of-file marker"));
     }
-    if admitted == Admitted::Pdf && has_zip_directory(body) {
-        return Err(denied("application/pdf that is also a ZIP archive"));
+    if admitted == Admitted::Pdf && has_zip_entry(body) {
+        return Err(denied("application/pdf containing a ZIP archive"));
     }
     Ok(())
 }
@@ -101,26 +101,36 @@ fn has_pdf_end_marker(bytes: &[u8]) -> bool {
     tail.windows(MARKER.len()).any(|window| window == MARKER)
 }
 
-/// Whether the body ends with a ZIP end-of-central-directory record, the part
-/// every ZIP reader (and so every OOXML application) locates from the end of
-/// the file, even when foreign bytes such as a PDF header precede the archive.
-/// The record may be followed by a comment of up to 65535 bytes.
-fn has_zip_directory(bytes: &[u8]) -> bool {
-    const RECORD: usize = 22;
-    const SIGNATURE: &[u8] = b"PK\x05\x06";
-    let window_start = bytes.len().saturating_sub(RECORD + usize::from(u16::MAX));
-    let field =
-        |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes")) as u64;
-    (window_start..=bytes.len().saturating_sub(RECORD))
-        .filter(|&at| bytes.len() >= RECORD && bytes[at..].starts_with(SIGNATURE))
-        .any(|at| {
-            // A real record describes a central directory that fits in front of
-            // it (or defers to ZIP64 with all-ones fields). Requiring that keeps
-            // the four signature bytes inside a compressed PDF stream harmless.
-            let (size, offset) = (field(at + 12), field(at + 16));
-            let zip64 = u64::from(u32::MAX);
-            size == zip64 || offset == zip64 || size + offset <= at as u64
+/// Whether a ZIP entry header occurs anywhere in the body. Every archive with
+/// content has one local header and one central-directory header per file, and
+/// readers that repair damaged archives rebuild them from the local headers
+/// alone, so this holds wherever the archive sits and whatever state its
+/// end-of-directory record is in.
+///
+/// The four signature bytes alone turn up by chance in large compressed PDF
+/// streams, so a match must also carry a defined compression method and a
+/// non-empty name that fits in the body. An entry failing that cannot be
+/// extracted by any reader.
+fn has_zip_entry(bytes: &[u8]) -> bool {
+    // (third and fourth signature byte, offset of method, of name length, of name)
+    const HEADERS: [([u8; 2], usize, usize, usize); 2] =
+        [([3, 4], 8, 26, 30), ([1, 2], 10, 28, 46)];
+    // APPNOTE 4.4.5 defines methods 0-20 and 93-99.
+    const MAX_METHOD: u16 = 99;
+    let field = |at: usize| {
+        bytes
+            .get(at..at + 2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+    };
+    memchr::memmem::find_iter(bytes, b"PK").any(|at| {
+        HEADERS.iter().any(|&(kind, method, name_length, name)| {
+            bytes.get(at + 2..at + 4) == Some(kind.as_slice())
+                && field(at + method).is_some_and(|method| method <= MAX_METHOD)
+                && field(at + name_length).is_some_and(|length| {
+                    length > 0 && at + name + usize::from(length) <= bytes.len()
+                })
         })
+    })
 }
 
 fn denied(found: &str) -> MediaError {
@@ -162,33 +172,34 @@ pub(super) mod fixtures {
             b"<Relationships/>",
         ));
         let directory_offset = file.len();
-        file.extend(zip_end(4, directory_offset, b""));
+        file.extend(zip_end(4, directory_offset));
         file
     }
 
-    /// ZIP end-of-central-directory record with an optional archive comment.
-    fn zip_end(entries: u16, directory_offset: usize, comment: &[u8]) -> Vec<u8> {
+    /// ZIP end-of-central-directory record without an archive comment.
+    fn zip_end(entries: u16, directory_offset: usize) -> Vec<u8> {
         let mut record = b"PK\x05\x06\0\0\0\0".to_vec();
         record.extend_from_slice(&entries.to_le_bytes());
         record.extend_from_slice(&entries.to_le_bytes());
         record.extend_from_slice(&0u32.to_le_bytes());
         record.extend_from_slice(&(directory_offset as u32).to_le_bytes());
-        record.extend_from_slice(&(comment.len() as u16).to_le_bytes());
-        record.extend_from_slice(comment);
+        record.extend_from_slice(&[0, 0]);
         record
     }
 
-    /// A Word document dressed as a PDF: PDF header in front, and the PDF end
-    /// marker tucked into the ZIP archive comment after `padding` filler bytes.
-    /// ZIP readers still open it.
-    pub(crate) fn pdf_wrapped_docx(padding: usize) -> Vec<u8> {
+    /// A Word document dressed as a PDF: PDF header in front, then the archive,
+    /// then `filler` bytes and the PDF end marker. With `end_record` false the
+    /// archive lacks its end-of-directory record, as a damaged file that Office
+    /// offers to repair would.
+    pub(crate) fn pdf_wrapped_docx(filler: usize, end_record: bool) -> Vec<u8> {
         let mut file = b"%PDF-1.7\n".to_vec();
         let mut docx = ooxml("word");
-        docx.truncate(docx.len() - 22);
-        let directory_offset = docx.len();
+        if !end_record {
+            docx.truncate(docx.len() - 22);
+        }
         file.extend(docx);
-        let comment = [vec![b' '; padding], b"\n%%EOF\n".to_vec()].concat();
-        file.extend(zip_end(4, directory_offset, &comment));
+        file.extend(std::iter::repeat_n(b' ', filler));
+        file.extend_from_slice(b"\n%%EOF\n");
         file
     }
 
@@ -322,22 +333,37 @@ mod tests {
                 "{extension}"
             );
         }
-        // Nor is an Office document that carries both PDF markers around its
-        // ZIP archive, wherever the archive comment puts the end marker.
-        for padding in [0, 900, usize::from(u16::MAX) - 7] {
-            let polyglot = fixtures::pdf_wrapped_docx(padding);
+        // Nor is an Office document that carries both PDF markers, wherever the
+        // archive sits before the end marker and whether or not it is intact.
+        for (filler, end_record) in [(0, true), (900, true), (200_000, true), (0, false)] {
+            let polyglot = fixtures::pdf_wrapped_docx(filler, end_record);
             assert_eq!(admit_upload(&polyglot, true).ok(), Some(Admitted::Pdf));
             assert!(has_pdf_end_marker(&polyglot), "fixture must end like a PDF");
             assert!(
                 confirm_upload(&polyglot, Admitted::Pdf).is_err(),
-                "comment padding {padding}"
+                "filler {filler}, end record {end_record}"
             );
         }
-        // The bare ZIP signature inside PDF stream data is not an archive.
-        let mut stream_bytes = b"%PDF-1.7\nstream\nPK\x05\x06".to_vec();
-        stream_bytes.extend([0x7f; 18]);
-        stream_bytes.extend(b"\nendstream\n%%EOF\n");
-        assert!(confirm_upload(&stream_bytes, Admitted::Pdf).is_ok());
+        // A central-directory header alone is refused as well.
+        let mut directory_only = b"%PDF-1.7\nPK\x01\x02".to_vec();
+        directory_only.extend([0; 24]);
+        directory_only.extend([1, 0]);
+        directory_only.extend([0; 16]);
+        directory_only.extend(b"a\n%%EOF\n");
+        assert!(confirm_upload(&directory_only, Admitted::Pdf).is_err());
+        // Bare ZIP signature bytes inside PDF stream data are not an entry:
+        // no reader could extract one with an undefined compression method.
+        for signature in [b"PK\x03\x04", b"PK\x01\x02", b"PK\x05\x06"] {
+            let mut stream_bytes = b"%PDF-1.7\nstream\n".to_vec();
+            stream_bytes.extend_from_slice(signature);
+            stream_bytes.extend([0xff; 64]);
+            stream_bytes.extend(b"\nendstream\n%%EOF\n");
+            assert!(confirm_upload(&stream_bytes, Admitted::Pdf).is_ok());
+            // Nor is a signature cut off by the end of the body.
+            let mut truncated = b"%PDF-1.7\n%%EOF\n".to_vec();
+            truncated.extend_from_slice(signature);
+            assert!(confirm_upload(&truncated, Admitted::Pdf).is_ok());
+        }
         // The end marker must close the file, not merely occur early in it.
         let mut early_marker = fixtures::PDF.to_vec();
         early_marker.extend(std::iter::repeat_n(b' ', 2048));
