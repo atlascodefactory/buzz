@@ -71,6 +71,7 @@ tempfile = "3"
 bytes = "1"
 http-body-util = "0.1"
 infer = "0.19"
+memchr = "2"
 serde_yaml      = { workspace = true }
 sha2            = { workspace = true }
 hmac            = { workspace = true }
@@ -99,6 +100,9 @@ ring = "0.17"
 # in settings_tests.rs (key-pairing build_router tests).
 jsonwebtoken = { version = "10.4.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 http-body = "1"
+# Builds real legacy Office (OLE2) fixtures for the upload-policy tests; already
+# in the dependency graph through `infer`.
+cfb = "0.7"
 buzz-core = { workspace = true, features = ["test-utils"] }
 buzz-auth = { workspace = true, features = ["dev", "test-utils"] }
 reqwest = { workspace = true }
