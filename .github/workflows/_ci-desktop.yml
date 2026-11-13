@@ -127,7 +127,11 @@ jobs:
 
   desktop-smoke-e2e:
     name: Desktop Smoke E2E (${{ matrix.shard }})
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest now resolves to ubuntu-26.04, and the locked
+    # Playwright 1.60 has no Chromium build for it ("Playwright does not
+    # support chromium on ubuntu26.04-x64"; support starts in 1.61). Drop the
+    # pin together with the Playwright bump from block/buzz#9418.
+    runs-on: ubuntu-24.04
     # A smoke shard needs ~12m, and Chromium dependency setup is bounded by
     # ci-apt-retry.sh (~25m worst case). Leave time for the full suite
     # and its reports to finish.
