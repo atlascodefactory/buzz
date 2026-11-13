@@ -49,8 +49,18 @@ mod image_policy_postgres_tests {
                 ("mp4", b"\0\0\0\x18ftypisom\0\0\0\0isommp42"),
                 ("iso-bmff", b"\0\0\0\x18ftypPRIV\0\0\0\0isommp42"),
                 ("svg", b"<svg></svg>"),
-                ("html", b"<!DOCTYPE html><html><body>hi</body></html>"),
-                ("markdown", b"# Heading\n\nplain text"),
+                (
+                    "svg with declaration",
+                    b"<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\"/>",
+                ),
+                ("rtf", b"{\\rtf1\\ansi Word document}"),
+                (
+                    "excel 2003 xml",
+                    b"<Workbook xmlns=\"urn:schemas-microsoft-com:office:spreadsheet\"/>",
+                ),
+                ("shell script", b"#!/bin/sh\necho hi\n"),
+                ("latin-1 text", b"Gr\xfc\xdfe"),
+                ("text with NUL", b"notes\0"),
                 ("empty", b""),
             ]
             .map(|(label, bytes)| (label.to_string(), bytes.to_vec())),
@@ -149,7 +159,7 @@ mod image_policy_postgres_tests {
 
     #[test]
     #[ignore = "requires Postgres"]
-    fn policy_preserves_image_and_pdf_round_trips_and_existing_file_download() {
+    fn policy_preserves_image_pdf_and_text_round_trips_and_existing_file_download() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -215,7 +225,27 @@ mod image_policy_postgres_tests {
         );
         let legacy = upload(&state, "/media/upload", pdf);
         assert_eq!(legacy.0, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{:?}", legacy.2);
-        for body in [old_file.as_slice(), png.as_slice(), pdf] {
+        // Markdown and HTML are admitted on `/upload` as plain text and stored
+        // byte-identical. Markdown has no signature, so it keeps the generic
+        // type and `.bin` address; recognizable HTML is stored as `.html`.
+        let markdown = "# \u{dc}bersicht\n\n- Punkt\n".as_bytes();
+        let html = b"<!DOCTYPE html><html><body><p>hi</p></body></html>".as_slice();
+        for (body, mime, extension) in [
+            (markdown, "application/octet-stream", "bin"),
+            (html, "text/html", "html"),
+        ] {
+            let uploaded = upload(&state, "/upload", body);
+            assert_eq!(uploaded.0, StatusCode::OK, "{mime}: {:?}", uploaded.2);
+            let descriptor: serde_json::Value = serde_json::from_slice(&uploaded.2).unwrap();
+            assert_eq!(descriptor["type"], mime);
+            assert_eq!(
+                descriptor["url"],
+                format!("https://{host}/media/{}.{extension}", sha256_hex(body))
+            );
+            let legacy = upload(&state, "/media/upload", body);
+            assert_eq!(legacy.0, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{:?}", legacy.2);
+        }
+        for body in [old_file.as_slice(), png.as_slice(), pdf, markdown, html] {
             let hash = sha256_hex(body);
             let mut headers = axum::http::HeaderMap::new();
             headers.insert(
@@ -232,6 +262,10 @@ mod image_policy_postgres_tests {
             ));
             assert_eq!(download.0, StatusCode::OK, "download: {:?}", download.2);
             assert_eq!(download.2.as_ref(), body);
+            // Only images render inline; PDF, Markdown and HTML are downloads,
+            // so the relay never serves uploaded HTML as an active page.
+            let disposition = download.1["content-disposition"].to_str().unwrap();
+            assert_eq!(disposition == "inline", body == png.as_slice(), "{disposition}");
         }
         // A magic-byte prefix alone must not pass full image validation.
         for body in [

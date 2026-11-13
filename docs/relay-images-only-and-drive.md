@@ -1,11 +1,12 @@
-# Direct image and PDF uploads and planned Drive folders
+# Direct image, PDF and text uploads and planned Drive folders
 
 ## Relay upload policy
 
 Set `BUZZ_MEDIA_IMAGES_ONLY=true` on the relay to accept only JPEG, PNG,
-GIF and WebP images and PDF documents as direct uploads. The variable name
-predates the PDF allowance (decided 2026-11-12) and is kept so prepared
-deployment configuration stays valid. The default is `false`, preserving the
+GIF and WebP images, PDF documents and plain-text files such as Markdown and
+HTML as direct uploads. The variable name predates the PDF and text allowances
+(decided 2026-11-12 and 2026-11-13) and is kept so prepared deployment
+configuration stays valid. The default is `false`, preserving the
 upstream attachment behavior for other deployments. Invalid flag values fail
 startup. The official clients need no modification.
 
@@ -25,14 +26,28 @@ pipeline. Filename extensions and request Content-Type cannot grant admission.
   through the generic-file pipeline, capped by `BUZZ_MAX_FILE_BYTES` (default
   100 MB), and served as a download (`Content-Disposition: attachment`), never
   rendered inline by the relay.
-- Hash verification, authentication and rate limits apply to both kinds.
+- Markdown, HTML and other plain text are accepted at `PUT /upload` only, with
+  the same cap and download-only serving as PDFs. Markdown has no signature, so
+  the rule is about content, not about the format name: the body must be
+  non-empty UTF-8 without control characters (tab, line feed, form feed and
+  carriage return excepted). That also admits CSV, JSON, source code and
+  notes, and refuses UTF-16 and legacy 8-bit encodings. Text formats with a
+  signature of their own stay out: RTF, shell scripts, XML-declared documents
+  (including SVG and the Word and Excel 2003 XML formats), an SVG document
+  without a declaration, and Office XML written without one. The relay cannot
+  tell Markdown from other text, so Markdown is stored as
+  `application/octet-stream` at `/media/<sha256>.bin`; only the filename the
+  client puts in the message carries `.md`. Recognizable HTML is stored as
+  `text/html` at `/media/<sha256>.html`. The relay never serves either inline.
+- Hash verification, authentication and rate limits apply to all kinds.
 
 Rejected attachments return HTTP 415 with a message asking the user to upload
 the file to Google Drive and share its link. The unchanged client controls the
 presentation of that error. Word, Excel and PowerPoint files (`.docx`, `.xlsx`,
-`.pptx` are ZIP containers; `.doc`, `.xls`, `.ppt` are OLE2 containers), other
-archives, Markdown, HTML and plain text, SVG, audio and video (including voice
-notes) cannot be uploaded directly when this policy is enabled. Renaming such a
+`.pptx` are ZIP containers; `.doc`, `.xls`, `.ppt` are OLE2 containers), RTF,
+other archives, SVG, audio and video (including voice notes) cannot be uploaded
+directly when this policy is enabled. An HTML or CSV file that Word or Excel
+could also open is still plain text and is admitted. Renaming such a
 file to `.pdf` or declaring it `application/pdf` does not admit it. The PDF
 check is structural, not a full parse: it keeps Office and other formats out,
 but it does not validate, sanitize or scan PDF content, and it does not detect

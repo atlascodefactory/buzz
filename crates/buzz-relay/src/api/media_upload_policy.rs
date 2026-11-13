@@ -22,6 +22,9 @@ pub(super) enum Admitted {
     Image,
     /// PDF; stored through the generic-file pipeline and served as a download.
     Pdf,
+    /// Markdown, HTML or other plain UTF-8 text; stored and served like a PDF.
+    /// Markdown has no signature, so text is admitted as a class.
+    Text,
 }
 
 impl Admitted {
@@ -31,7 +34,7 @@ impl Admitted {
         match self {
             Self::Any => media.max_image_bytes.max(media.max_file_bytes),
             Self::Image => media.max_image_bytes,
-            Self::Pdf => media.max_file_bytes,
+            Self::Pdf | Self::Text => media.max_file_bytes,
         }
     }
 }
@@ -40,7 +43,7 @@ impl Admitted {
 pub(super) fn request_body_limit(media: &MediaConfig, images_only: bool) -> u64 {
     if images_only {
         // The kind is unknown until the first bytes arrive, so admit the larger
-        // of the two allowed kinds; `Admitted::buffer_limit` narrows it after.
+        // of the allowed kinds; `Admitted::buffer_limit` narrows it after.
         media.max_image_bytes.max(media.max_file_bytes)
     } else {
         media.max_image_bytes.max(media.max_video_bytes)
@@ -49,18 +52,26 @@ pub(super) fn request_body_limit(media: &MediaConfig, images_only: bool) -> u64 
 
 /// Admit an upload from its leading bytes. Filenames and the request
 /// Content-Type are never consulted, so a renamed Office document (a ZIP or
-/// OLE2 container) cannot be admitted as a PDF.
+/// OLE2 container) cannot be admitted as a PDF or as text.
 pub(super) fn admit_upload(prefix: &[u8], images_only: bool) -> Result<Admitted, MediaError> {
     if !images_only {
         return Ok(Admitted::Any);
     }
-    let mime = infer::get(prefix)
-        .map(|kind| kind.mime_type())
-        .unwrap_or("application/octet-stream");
-    match mime {
-        "image/jpeg" | "image/png" | "image/gif" | "image/webp" => Ok(Admitted::Image),
-        "application/pdf" if has_pdf_header(prefix) => Ok(Admitted::Pdf),
-        _ => Err(denied(mime)),
+    classify(prefix, false)
+}
+
+/// `complete` is false for the leading probe, whose last character may be cut.
+fn classify(bytes: &[u8], complete: bool) -> Result<Admitted, MediaError> {
+    let sniffed = infer::get(bytes).map(|kind| kind.mime_type());
+    match sniffed {
+        Some("image/jpeg" | "image/png" | "image/gif" | "image/webp") => Ok(Admitted::Image),
+        Some("application/pdf") if has_pdf_header(bytes) => Ok(Admitted::Pdf),
+        // No signature at all, or recognizable HTML. Anything else with a
+        // signature is a format of its own, including the text-based ones:
+        // RTF, shell scripts, and XML-declared documents such as SVG and the
+        // Word and Excel 2003 XML formats.
+        None | Some("text/html") if is_plain_text(bytes, complete) => Ok(Admitted::Text),
+        _ => Err(denied(sniffed.unwrap_or("application/octet-stream"))),
     }
 }
 
@@ -73,8 +84,11 @@ pub(super) fn confirm_upload(body: &[u8], admitted: Admitted) -> Result<(), Medi
     if admitted == Admitted::Any {
         return Ok(());
     }
-    if admit_upload(body, true)? != admitted {
+    if classify(body, true)? != admitted {
         return Err(denied("ambiguous content"));
+    }
+    if admitted == Admitted::Text && is_office_xml(body) {
+        return Err(denied("Office XML document"));
     }
     if admitted == Admitted::Pdf && !has_pdf_end_marker(body) {
         return Err(denied("application/pdf without an end-of-file marker"));
@@ -83,6 +97,49 @@ pub(super) fn confirm_upload(body: &[u8], admitted: Admitted) -> Result<(), Medi
         return Err(denied("application/pdf containing a ZIP archive"));
     }
     Ok(())
+}
+
+/// Non-empty UTF-8 text without control characters other than tab, line feed,
+/// form feed and carriage return. Binary formats, UTF-16 and legacy 8-bit
+/// encodings fail this; so does anything with a NUL. Two text formats that the
+/// signature sniffing misses are excluded by how they open: an SVG document
+/// without an XML declaration, and a PDF whose header sits behind whitespace.
+/// Text that merely mentions or embeds either further down is unaffected.
+fn is_plain_text(bytes: &[u8], complete: bool) -> bool {
+    let valid_utf8 = match std::str::from_utf8(bytes) {
+        Ok(_) => true,
+        // An incomplete final character is expected in a cut-off probe only.
+        Err(error) => !complete && error.error_len().is_none(),
+    };
+    let control = |byte: &u8| matches!(byte, 0..=8 | 11 | 14..=31 | 127);
+    let content = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    let content = content.trim_ascii_start();
+    let opens_with = |tag: &[u8]| {
+        content
+            .get(..tag.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(tag))
+    };
+    !bytes.is_empty()
+        && valid_utf8
+        && !bytes.iter().any(control)
+        && !opens_with(b"<svg")
+        && !opens_with(b"%PDF-")
+}
+
+/// Word, Excel and PowerPoint documents saved in their XML text formats (Excel
+/// and Word 2003 XML, Flat OPC), which carry one of these markers on the root
+/// element or in a processing instruction. With an XML declaration they are
+/// refused as XML already; this covers files written without one.
+fn is_office_xml(text: &[u8]) -> bool {
+    const MARKERS: [&[u8]; 4] = [
+        b"<?mso-application",
+        b"urn:schemas-microsoft-com:office:spreadsheet",
+        b"schemas.microsoft.com/office/word/2003/wordml",
+        b"schemas.microsoft.com/office/2006/xmlPackage",
+    ];
+    MARKERS
+        .iter()
+        .any(|marker| memchr::memmem::find(text, marker).is_some())
 }
 
 /// `%PDF-<major>.<minor>` at byte zero, as ISO 32000 requires.
@@ -135,8 +192,9 @@ fn has_zip_entry(bytes: &[u8]) -> bool {
 
 fn denied(found: &str) -> MediaError {
     MediaError::DisallowedContentType(format!(
-        "{found}; only JPEG, PNG, GIF and WebP images and PDF documents can be \
-         uploaded directly. Upload other files to Google Drive and share the link."
+        "{found}; only JPEG, PNG, GIF and WebP images, PDF documents and Markdown, \
+         HTML or other plain-text files can be uploaded directly. Upload other \
+         files to Google Drive and share the link."
     ))
 }
 
@@ -255,7 +313,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn policy_admits_only_images_and_pdf_by_content() {
+    fn policy_admits_only_images_pdf_and_plain_text_by_content() {
         let cases: &[(&[u8], Option<Admitted>)] = &[
             (b"\xff\xd8\xff\xe0", Some(Admitted::Image)),
             (b"\x89PNG\r\n\x1a\n", Some(Admitted::Image)),
@@ -275,10 +333,54 @@ mod tests {
             (b"ID3\x04\0\0\0\0\0\0", None),
             (b"\0\0\0\x18ftypisom\0\0\0\0isommp42", None),
             (b"\0\0\0\x18ftypPRIV\0\0\0\0isommp42", None),
+            // Markdown has no signature: plain UTF-8 text is admitted as a class,
+            // and HTML with it, whether or not its opening is recognizable.
+            (b"# Markdown\n", Some(Admitted::Text)),
+            (
+                "# \u{dc}berschrift \u{2013} \u{1f600}\n".as_bytes(),
+                Some(Admitted::Text),
+            ),
+            (
+                b"\xef\xbb\xbf# With byte-order mark\r\n",
+                Some(Admitted::Text),
+            ),
+            (
+                b"<!DOCTYPE html><html><body>hi</body></html>",
+                Some(Admitted::Text),
+            ),
+            (b"<html>page</html>", Some(Admitted::Text)),
+            (
+                b"<p align=\"center\">README</p>\n\n# Title\n",
+                Some(Admitted::Text),
+            ),
+            (
+                b"<section><svg viewBox=\"0 0 1 1\"></svg></section>",
+                Some(Admitted::Text),
+            ),
+            (b"plain notes", Some(Admitted::Text)),
+            // Text-based formats with a signature of their own stay out.
+            (b"{\\rtf1\\ansi Word document}", None),
+            (
+                b"<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\"/>",
+                None,
+            ),
+            (
+                b"<?xml version=\"1.0\"?><?mso-application progid=\"Excel.Sheet\"?>",
+                None,
+            ),
+            (b"#!/bin/sh\nrm -rf /\n", None),
+            // An SVG document without a declaration is not plain text either.
             (b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>", None),
-            (b"<html>not an image</html>", None),
-            (b"# Markdown\n", None),
-            (b"not an image", None),
+            (b"\xef\xbb\xbf \n<SVG></SVG>", None),
+            (
+                b"The header reads `%PDF-1.7`, see ISO 32000.\n",
+                Some(Admitted::Text),
+            ),
+            // Not UTF-8 text: NUL and other controls, UTF-16, Latin-1.
+            (b"text with a \0 byte", None),
+            (b"escape \x1b[0m sequence", None),
+            (b"\xff\xfe#\0 \0U\0T\0F\0-\x001\x006\0", None),
+            (b"Gr\xfc\xdfe in Latin-1", None),
             (b"", None),
         ];
         for &(bytes, admitted) in cases {
@@ -304,13 +406,60 @@ mod tests {
                 "{extension}: {error:?}"
             );
             // The whole file cannot confirm as either allowed kind.
-            for admitted in [Admitted::Image, Admitted::Pdf] {
+            for admitted in [Admitted::Image, Admitted::Pdf, Admitted::Text] {
                 assert!(confirm_upload(&bytes, admitted).is_err(), "{extension}");
             }
             assert!(
                 admit_upload(&bytes, false).is_ok(),
                 "{extension}: policy off"
             );
+        }
+    }
+
+    #[test]
+    fn text_probe_tolerates_only_a_character_cut_by_the_probe_boundary() {
+        // "ü" is two bytes; a 4 KiB probe may end between them.
+        let cut = &"Gr\u{fc}".as_bytes()[..3];
+        assert_eq!(admit_upload(cut, true).ok(), Some(Admitted::Text));
+        // The complete body gets no such allowance, and a broken sequence in
+        // the middle is never text.
+        assert!(confirm_upload(cut, Admitted::Text).is_err());
+        assert!(admit_upload(b"Gr\xc3 e", true).is_err());
+        assert!(confirm_upload("Gr\u{fc}\u{df}e\n".as_bytes(), Admitted::Text).is_ok());
+    }
+
+    #[test]
+    fn office_documents_in_xml_text_form_are_not_plain_text() {
+        // Without an XML declaration these sniff as nothing, so the probe
+        // admits them as text; the whole-body check must refuse them.
+        let spreadsheet: &[u8] =
+            b"<Workbook xmlns=\"urn:schemas-microsoft-com:office:spreadsheet\"><Worksheet/></Workbook>";
+        let word: &[u8] =
+            b"<w:wordDocument xmlns:w=\"http://schemas.microsoft.com/office/word/2003/wordml\"/>";
+        let flat_opc: &[u8] =
+            b"<pkg:package xmlns:pkg=\"http://schemas.microsoft.com/office/2006/xmlPackage\"/>";
+        let late_marker = [
+            vec![b'\n'; 100_000],
+            b"<?mso-application progid=\"Word.Document\"?>".to_vec(),
+        ]
+        .concat();
+        for body in [spreadsheet, word, flat_opc, late_marker.as_slice()] {
+            assert_eq!(
+                admit_upload(&body[..body.len().min(4096)], true).ok(),
+                Some(Admitted::Text)
+            );
+            assert!(
+                confirm_upload(body, Admitted::Text).is_err(),
+                "{:?}",
+                &body[..20]
+            );
+        }
+        // Ordinary Markdown and HTML confirm.
+        for body in [
+            &b"# Notes\n\n- one\n- two\n"[..],
+            b"<!DOCTYPE html><html><body>hi</body></html>",
+        ] {
+            assert!(confirm_upload(body, Admitted::Text).is_ok());
         }
     }
 
@@ -323,6 +472,9 @@ mod tests {
         // A body may not switch kinds between the probe and the pipeline.
         assert!(confirm_upload(fixtures::PDF, Admitted::Image).is_err());
         assert!(confirm_upload(b"\x89PNG\r\n\x1a\n", Admitted::Pdf).is_err());
+        assert!(confirm_upload(fixtures::PDF, Admitted::Text).is_err());
+        assert!(confirm_upload(b"# Markdown\n", Admitted::Pdf).is_err());
+        assert!(confirm_upload(b"# Markdown\n", Admitted::Image).is_err());
         // A PDF signature in front of something else is not a PDF.
         assert!(confirm_upload(b"%PDF-1.7\nnot a document", Admitted::Pdf).is_err());
         for (extension, _, office) in fixtures::office_files() {
@@ -382,6 +534,7 @@ mod tests {
         assert_eq!(request_body_limit(&media, false), 90, "policy off: video");
         assert_eq!(Admitted::Image.buffer_limit(&media), 10);
         assert_eq!(Admitted::Pdf.buffer_limit(&media), 20);
+        assert_eq!(Admitted::Text.buffer_limit(&media), 20);
         assert_eq!(Admitted::Any.buffer_limit(&media), 20);
         media.max_image_bytes = 30;
         assert_eq!(request_body_limit(&media, true), 30, "image cap is larger");
